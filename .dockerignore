@@ -1,0 +1,11 @@
+node_modules
+dist
+.data
+dev
+tests
+*.log
+.DS_Store
+Dockerfile
+docker-compose.yml
+README.md
+verify

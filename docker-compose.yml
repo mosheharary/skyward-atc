@@ -1,0 +1,14 @@
+services:
+  skyward-atc:
+    build: .
+    image: skyward-atc:latest
+    container_name: skyward-atc
+    ports:
+      # Bound to localhost only. Use "8080:8080" to allow other machines on your network.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # Profiles, checkpoints, saves and results live here and survive restarts/rebuilds.
+      - ./skyward-data:/data
+    environment:
+      LOG_REQUESTS: "0"
+    restart: unless-stopped

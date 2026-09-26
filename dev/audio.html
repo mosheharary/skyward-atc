@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Audio Lab</title>
+    <style>
+      :root {
+        --bg: #0d1117;
+        --panel: #161b22;
+        --line: #30363d;
+        --text: #e6edf3;
+        --muted: #8b949e;
+        --accent: #2f81f7;
+        --ok: #3fb950;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.4 system-ui, -apple-system, 'Segoe UI', sans-serif;
+        transition: background 0.08s;
+      }
+      body.flash {
+        background: #3a3f55;
+      }
+      header {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+        flex-wrap: wrap;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 12px 0 0;
+      }
+      main {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 12px;
+        padding: 12px 16px 24px;
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px 12px;
+      }
+      section h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0 0 8px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 110px 1fr 52px;
+        gap: 8px;
+        align-items: center;
+        margin: 4px 0;
+      }
+      .row output {
+        text-align: right;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      button {
+        background: #21262d;
+        color: var(--text);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 10px;
+        cursor: pointer;
+        font: inherit;
+      }
+      button:hover {
+        border-color: var(--accent);
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+      label.check {
+        display: inline-flex;
+        gap: 6px;
+        align-items: center;
+        margin: 4px 12px 4px 0;
+      }
+      select,
+      input[type='range'] {
+        width: 100%;
+      }
+      #meter {
+        width: 220px;
+        height: 12px;
+        background: #21262d;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      #meterBar {
+        height: 100%;
+        width: 0;
+        background: linear-gradient(90deg, var(--ok), #d29922, #f85149);
+      }
+      #status,
+      #debug {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      #log {
+        height: 180px;
+        overflow: auto;
+        font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: var(--muted);
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Audio Lab</h1>
+      <button id="start" class="primary">Start audio</button>
+      <div id="meter"><div id="meterBar"></div></div>
+      <span id="status">not started</span>
+      <span id="debug"></span>
+    </header>
+    <main id="app"></main>
+    <script type="module" src="./audio.ts"></script>
+  </body>
+</html>
