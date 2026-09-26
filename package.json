@@ -3,6 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "description": "Skyward ATC - a 3D air traffic control simulator that runs in the browser",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
