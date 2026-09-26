@@ -26,6 +26,18 @@ Wiping it (`docker compose down -v`) deletes all profiles and saves.
 The port is bound to `127.0.0.1` only. Change it to `"8080:8080"` in `docker-compose.yml` to allow other
 machines on your network.
 
+## Deploy to Vercel
+
+On Vercel the client is served as a static Vite build and the API runs as a Node function (`api/index.mjs`)
+backed by Postgres (Neon) instead of SQLite. Point `DATABASE_URL` at a Postgres database; the schema is created
+on first request.
+
+```sh
+vercel link --project skyward-atc
+vercel env add DATABASE_URL production   # paste the Postgres connection string
+vercel --prod
+```
+
 ## How to play
 
 Press **F1** or **?** in the game, or choose **Help** in the main menu, for the full manual. The basics:
@@ -56,3 +68,5 @@ npm run typecheck && npm test && npm run build
 | `src/audio` | WebAudio engine: engines, ambience, radio, speech |
 | `src/ui`, `src/app` | Menus, radar scope, command panel, help, game loop |
 | `server/server.mjs` | Static server + JSON API on `node:sqlite` |
+| `server/api-core.mjs` | API routes shared by the Node server and the Vercel function; `store-sqlite.mjs` / `store-postgres.mjs` hold storage |
+| `api/index.mjs`, `vercel.json` | Vercel function (Postgres) and routing / headers |

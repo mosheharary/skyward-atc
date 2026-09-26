@@ -5,6 +5,9 @@
   "description": "Skyward ATC - a 3D air traffic control simulator that runs in the browser",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "dev": "vite",
     "dev:server": "PORT=8787 DATA_DIR=./.data node server/server.mjs",
@@ -14,6 +17,7 @@
     "start": "node server/server.mjs"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "three": "^0.186.1"
   },
   "devDependencies": {

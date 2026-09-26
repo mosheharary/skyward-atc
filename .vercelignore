@@ -1,0 +1,9 @@
+.data
+dist
+verify
+dev
+tests
+Dockerfile
+docker-compose.yml
+.env
+.env.*
