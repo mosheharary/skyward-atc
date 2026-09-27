@@ -8,11 +8,16 @@ import type { AircraftAudioState, IAudioEngine } from '../audio/contracts';
 import { AIRLINE_BY_CODE } from '../sim/airlines';
 import { SHIFT_BY_ID } from '../sim/career';
 import { simToWorld } from '../core/units';
-import { RadarScope } from '../ui/radar';
-import { CommandPanel, REQUEST_LABEL } from '../ui/commandPanel';
-import { h, fmtClock, fmtDuration } from '../ui/dom';
+import { RadarScope, type RadarOptions } from '../ui/radar';
+import { CommandPanel } from '../ui/commandPanel';
+import { StripBoard } from '../ui/strips';
+import { CommsPanel, type CommsEntry } from '../ui/comms';
+import { TopBar } from '../ui/topbar';
+import { Notifier, ScoreFeed, breakdownView, scoreBreakdown, togglePopover, type NoticeLevel } from '../ui/notifications';
+import { h } from '../ui/dom';
+import { icon } from '../ui/icons';
 import type { CheckpointSummary, Settings } from '../ui/api';
-import { fmtAltitude, fmtWind } from '../sim/phraseology';
+import { prefs } from '../ui/prefs';
 
 export interface GameHost {
   renderer: GameRenderer;
@@ -22,11 +27,15 @@ export interface GameHost {
   saveCheckpoint(state: WorldSnapshot, summary: CheckpointSummary, beacon?: boolean): Promise<boolean>;
   openHelp(section?: string): void;
   openPauseMenu(): void;
+  showSettings(): void;
+  /** Merge, apply and (debounced) persist a settings change made from inside the HUD. */
+  updateSettings(patch: Partial<Settings>): void;
   shiftEnded(world: World): void;
   isModalOpen(): boolean;
 }
 
 const SPEEDS = [1, 2, 4];
+const TOWER_PHASES = new Set(['final', 'landing', 'goaround', 'lineup', 'takeoff', 'holding']);
 
 export class Game {
   readonly world: World;
@@ -38,32 +47,37 @@ export class Game {
   private last = 0;
   private radar: RadarScope;
   private panel: CommandPanel;
-  private strips: HTMLElement;
-  private radioLog: HTMLElement;
-  private notices: HTMLElement;
-  private scoreFeed: HTMLElement;
+  private strips: StripBoard;
+  private comms: CommsPanel;
+  private topbar: TopBar;
+  private notifier: Notifier;
+  private scoreFeed: ScoreFeed;
+  private scorePop: HTMLElement | null = null;
   private labels: HTMLElement;
   private labelPool: HTMLElement[] = [];
-  private top: Record<string, HTMLElement> = {};
+  private body: HTMLElement;
   private mainView: HTMLElement;
   private miniView: HTMLElement;
+  private miniTag: HTMLElement;
   private view3d: HTMLElement;
   private viewRadar: HTMLElement;
   private radarBig = false;
   private attention = new Set<string>();
-  private stripKey = '';
   private stripT = 0;
   private saveT = 0;
   private dirty = false;
   private saving = false;
-  private lastSavedAt = 0;
+  private saveState: { state: 'ok' | 'bad' | 'none'; at: number } = { state: 'none', at: 0 };
   private fixResolve: ((f: string | null) => void) | null = null;
   private ended = false;
   private disposed = false;
   private readonly ro: ResizeObserver;
   private readonly keyHandler = (e: KeyboardEvent): void => this.onKey(e);
   private readonly visHandler = (): void => {
-    if (document.visibilityState === 'hidden') void this.save(true);
+    if (document.visibilityState === 'hidden') {
+      if (this.host.settings.pauseOnBlur && !this.paused) this.togglePause(true);
+      void this.save(true);
+    }
   };
   private readonly unloadHandler = (): void => void this.save(true, true);
   private fpsAcc = 0;
@@ -73,41 +87,24 @@ export class Game {
   constructor(private readonly host: GameHost, root: HTMLElement, world: World) {
     this.world = world;
     const r = host.renderer;
+    const s = host.settings;
     this.el = h('div', { class: 'game' });
+    this.notifier = new Notifier();
+    this.scoreFeed = new ScoreFeed();
+
     // ---- top bar
-    const tb = h('div', { class: 'topbar' });
-    const item = (key: string, label: string): HTMLElement => {
-      const v = h('span', { class: 'tb-v' });
-      this.top[key] = v;
-      tb.append(h('div', { class: `tb-item tb-${key}` }, h('span', { class: 'tb-l' }, label), v));
-      return v;
-    };
-    const def = world.airport.def;
-    tb.append(h('div', { class: 'tb-airport' }, h('b', null, def.icao), h('span', null, def.name)));
-    item('clock', 'LOCAL');
-    item('remain', 'SHIFT');
-    item('atis', 'ATIS');
-    item('wind', 'WIND');
-    item('rwy', 'RWY');
-    item('score', 'SCORE');
-    item('traffic', 'TRAFFIC');
-    const camBtns = (['tower', 'orbit', 'follow', 'cockpit'] as CameraMode[]).map((m, i) =>
-      h('button', { class: 'tb-btn cam', 'data-cam': m, title: `${m[0].toUpperCase() + m.slice(1)} view (${i + 1})`, onclick: () => this.setCamera(m) }, ['Tower', 'Orbit', 'Follow', 'Cockpit'][i]),
-    );
-    const speedBtn = h('button', { class: 'tb-btn', title: 'Simulation speed (+/-)', onclick: () => this.cycleSpeed() }, '×1');
-    this.top.speed = speedBtn;
-    const pauseBtn = h('button', { class: 'tb-btn', title: 'Pause (Space)', onclick: () => this.togglePause() }, '❚❚');
-    this.top.pause = pauseBtn;
-    tb.append(
-      h('div', { class: 'tb-spacer' }),
-      h('div', { class: 'tb-group' }, ...camBtns),
-      h('button', { class: 'tb-btn', title: 'Swap radar and 3D view (Tab)', onclick: () => this.swapViews() }, '⇄ Radar'),
-      h('div', { class: 'tb-group' }, pauseBtn, speedBtn),
-      h('button', { class: 'tb-btn', title: 'Help (F1)', onclick: () => host.openHelp() }, '? Help'),
-      h('button', { class: 'tb-btn', title: 'Menu (Esc)', onclick: () => host.openPauseMenu() }, '☰ Menu'),
-    );
-    this.top.saved = h('span', { class: 'tb-saved', title: 'Checkpoint status' }, '');
-    tb.append(this.top.saved);
+    this.topbar = new TopBar(world, {
+      camera: (m) => this.setCamera(m),
+      swap: () => this.swapViews(),
+      pause: () => this.togglePause(),
+      speed: (d) => this.cycleSpeed(d),
+      help: () => host.openHelp(),
+      menu: () => host.openPauseMenu(),
+      settings: () => host.showSettings(),
+      notifications: (anchor) => this.notifier.toggleCenter(this.el, anchor),
+      score: (anchor) => this.toggleScore(anchor),
+      drawer: () => this.el.classList.toggle('drawer-open'),
+    });
 
     // ---- views
     this.view3d = h('div', { class: 'view view-3d' }, r.renderer.domElement);
@@ -115,7 +112,9 @@ export class Game {
     this.view3d.append(this.labels);
     this.viewRadar = h('div', { class: 'view view-radar' });
     this.mainView = h('div', { class: 'main-view' }, this.view3d);
-    this.miniView = h('div', { class: 'mini-view' }, this.viewRadar);
+    this.miniTag = h('span', { class: 'view-tag' }, 'RADAR');
+    this.miniView = h('div', { class: 'mini-view' }, this.viewRadar, this.miniTag,
+      h('button', { class: 'mini view-swap', title: 'Swap views (Tab)', 'aria-label': 'Swap radar and 3D view', onclick: () => this.swapViews() }, icon('expand')));
     this.radar = new RadarScope(this.viewRadar, {
       select: (id) => this.select(id),
       vector: (id, hdg) => this.command(id, { kind: 'heading', hdg }),
@@ -124,12 +123,18 @@ export class Game {
         this.fixResolve?.(f);
         this.fixResolve = null;
       },
-    });
-    this.radar.reset(world);
+      options: (o) => this.saveRadarOptions(o),
+    }, this.radarOptions(s));
+    this.radar.reset(world, s.radarRange);
 
     // ---- panels
-    this.strips = h('div', { class: 'strips' });
-    const right = h('div', { class: 'right-col' }, this.miniView);
+    this.strips = new StripBoard({ select: (id) => this.select(id), collapse: () => this.toggleStrips() });
+    this.comms = new CommsPanel(world.airport.def.icao, {
+      select: (id) => world.byId(id) && this.select(id),
+      resized: (px) => host.updateSettings({ commsH: px }),
+      collapsed: (c) => host.updateSettings({ commsCollapsed: c }),
+    }, { height: s.commsH, collapsed: s.commsCollapsed });
+    const right = h('aside', { class: 'right-col', 'aria-label': 'Radar and command panel' }, this.miniView);
     this.panel = new CommandPanel(right, {
       send: (id, c) => this.command(id, c),
       pickFix: () => {
@@ -141,17 +146,23 @@ export class Game {
         this.select(id);
         this.setCamera('follow');
       },
+      history: (id) => this.comms.history(id),
     });
-    this.radioLog = h('div', { class: 'radio-log', 'aria-live': 'polite' });
-    this.notices = h('div', { class: 'notices' });
-    this.scoreFeed = h('div', { class: 'score-feed' });
-    const center = h('div', { class: 'center-col' }, this.mainView, this.radioLog, this.notices, this.scoreFeed);
-    this.el.append(tb, h('div', { class: 'game-body' }, h('div', { class: 'left-col' }, h('div', { class: 'col-title' }, 'Flight strips'), this.strips), center, right));
+    const center = h('main', { class: 'center-col' }, this.mainView, this.comms.el, this.notifier.toasts);
+    this.mainView.append(this.scoreFeed.el);
+    const left = h('aside', { class: 'left-col', 'aria-label': 'Flight strips' }, this.strips.el);
+    left.append(this.resizer('left'));
+    right.prepend(this.resizer('right'));
+    this.body = h('div', { class: 'game-body' }, left, center, right,
+      h('div', { class: 'drawer-scrim', onclick: () => this.el.classList.remove('drawer-open') }));
+    this.el.append(this.topbar.el, this.body);
+    this.applyLayout(s);
     root.appendChild(this.el);
+    this.notifier.onChange = () => this.updateTopBar();
 
     // Radio calls still queued as events are logged when drained; only replay older history.
     const pending = world.events.filter((e) => e.type === 'radio').length;
-    for (const e of world.radioLog.slice(0, world.radioLog.length - pending).slice(-25)) this.logRadio(e.from, e.id, e.text, !!e.urgent);
+    for (const e of world.radioLog.slice(0, world.radioLog.length - pending).slice(-40)) this.logRadio(e.from, e.id, e.text, !!e.urgent, e.t, true);
 
     r.load(world);
     r.onPick = (id) => this.select(id);
@@ -163,8 +174,8 @@ export class Game {
     document.addEventListener('visibilitychange', this.visHandler);
     window.addEventListener('pagehide', this.unloadHandler);
     host.audio.setMusic('none');
-    this.applySettings(host.settings);
-    this.updateCamButtons();
+    this.applySettings(s);
+    this.updateTopBar();
     this.last = performance.now();
     this.raf = requestAnimationFrame(this.loop);
     if (world.ended) this.finish();
@@ -176,6 +187,58 @@ export class Game {
     a.setVoiceEnabled(s.pilotVoices, s.controllerVoice);
     if (this.host.renderer.quality !== s.quality) this.host.renderer.setQuality(s.quality);
     this.labels.style.display = s.labels3d ? '' : 'none';
+    this.radar.setOptions(this.radarOptions(s));
+    this.applyLayout(s);
+  }
+
+  private radarOptions(s: Settings): RadarOptions {
+    return { rings: s.radarRings, fixes: s.radarFixes, water: s.radarWater, ils: s.radarIls, blocks: s.radarBlocks, trail: s.radarTrail, vector: s.radarVector, font: s.radarFont };
+  }
+
+  private saveRadarOptions(o: RadarOptions): void {
+    this.host.updateSettings({ radarRings: o.rings, radarFixes: o.fixes, radarWater: o.water, radarIls: o.ils, radarBlocks: o.blocks, radarTrail: o.trail, radarVector: o.vector, radarFont: o.font });
+  }
+
+  private applyLayout(s: Settings): void {
+    this.el.style.setProperty('--strips-w', `${s.stripsW}px`);
+    this.el.style.setProperty('--right-w', `${s.rightW}px`);
+    this.body?.classList.toggle('strips-collapsed', s.stripsCollapsed);
+    this.strips?.setCollapsed(s.stripsCollapsed);
+  }
+
+  private toggleStrips(): void {
+    // In the narrow (drawer) layout the collapse button closes the drawer instead.
+    if (this.el.classList.contains('drawer-open')) {
+      this.el.classList.remove('drawer-open');
+      return;
+    }
+    this.host.updateSettings({ stripsCollapsed: !this.host.settings.stripsCollapsed });
+  }
+
+  /** Drag handle on a column edge; persists the new width. */
+  private resizer(side: 'left' | 'right'): HTMLElement {
+    const el = h('div', { class: 'col-resize', title: 'Drag to resize', role: 'separator', 'aria-orientation': 'vertical' });
+    el.addEventListener('pointerdown', (e) => {
+      el.setPointerCapture(e.pointerId);
+      el.classList.add('active');
+      const x0 = e.clientX;
+      const w0 = side === 'left' ? this.host.settings.stripsW : this.host.settings.rightW;
+      let w = w0;
+      const move = (ev: PointerEvent): void => {
+        const dx = (ev.clientX - x0) / prefs.scale;
+        w = Math.round(side === 'left' ? Math.min(460, Math.max(210, w0 + dx)) : Math.min(560, Math.max(300, w0 - dx)));
+        this.el.style.setProperty(side === 'left' ? '--strips-w' : '--right-w', `${w}px`);
+      };
+      const up = (): void => {
+        el.classList.remove('active');
+        el.removeEventListener('pointermove', move);
+        el.removeEventListener('pointerup', up);
+        this.host.updateSettings(side === 'left' ? { stripsW: w } : { rightW: w });
+      };
+      el.addEventListener('pointermove', move);
+      el.addEventListener('pointerup', up);
+    });
+    return el;
   }
 
   private resize(): void {
@@ -187,13 +250,15 @@ export class Game {
   select(id: string | null): void {
     if (id === this.selected) return;
     this.selected = id;
+    this.comms.setSelected(id);
     if (id) {
       this.host.audio.playUI('select');
       const a = this.world.byId(id);
       if (a && this.host.renderer.mode === 'orbit') this.orbitOn(a);
       if (this.host.renderer.mode === 'follow' || this.host.renderer.mode === 'cockpit') this.host.renderer.setMode(this.host.renderer.mode, id);
+      if (this.el.classList.contains('drawer-open')) this.el.classList.remove('drawer-open');
     }
-    this.stripKey = '';
+    this.strips.update(this.world, this.selected);
   }
 
   command(id: string, c: Command): void {
@@ -222,78 +287,120 @@ export class Game {
     }
     r.setMode(m, this.selected);
     if (m === 'orbit') this.orbitOn(this.selected ? this.world.byId(this.selected) : undefined);
-    this.updateCamButtons();
+    if (this.radarBig) this.swapViews();
+    this.updateTopBar();
     this.host.audio.playUI('click');
-  }
-
-  private updateCamButtons(): void {
-    for (const b of this.el.querySelectorAll<HTMLElement>('[data-cam]')) b.classList.toggle('active', b.dataset.cam === this.host.renderer.mode);
   }
 
   togglePause(force?: boolean): void {
     this.paused = force ?? !this.paused;
-    this.top.pause.textContent = this.paused ? '▶' : '❚❚';
-    this.top.pause.classList.toggle('active', this.paused);
     this.el.classList.toggle('paused', this.paused);
+    this.updateTopBar();
     if (this.paused) void this.save();
   }
 
   cycleSpeed(dir = 1): void {
     const i = SPEEDS.indexOf(this.timeScale);
     this.timeScale = SPEEDS[Math.max(0, Math.min(SPEEDS.length - 1, dir > 0 ? (i + 1) % SPEEDS.length : i - 1))];
-    this.top.speed.textContent = `×${this.timeScale}`;
-    this.top.speed.classList.toggle('active', this.timeScale > 1);
+    this.updateTopBar();
   }
 
   swapViews(): void {
     this.radarBig = !this.radarBig;
     if (this.radarBig) {
-      this.mainView.replaceChildren(this.viewRadar);
-      this.miniView.replaceChildren(this.view3d);
+      this.mainView.replaceChildren(this.viewRadar, this.scoreFeed.el);
+      this.miniView.prepend(this.view3d);
     } else {
-      this.mainView.replaceChildren(this.view3d);
-      this.miniView.replaceChildren(this.viewRadar);
+      this.mainView.replaceChildren(this.view3d, this.scoreFeed.el);
+      this.miniView.prepend(this.viewRadar);
     }
+    this.miniTag.textContent = this.radarBig ? this.host.renderer.mode.toUpperCase() : 'RADAR';
     this.resize();
+    this.updateTopBar();
+  }
+
+  private toggleScore(anchor: HTMLElement): void {
+    this.scorePop = h('div', { class: 'popover score-pop', role: 'dialog', 'aria-label': 'Score breakdown' });
+    const { gained, lost } = scoreBreakdown(this.world.scoreLog);
+    const shift = this.world.cfg.shiftId ? SHIFT_BY_ID[this.world.cfg.shiftId] : null;
+    this.scorePop.append(
+      h('h4', null, 'Session score'),
+      h('div', { class: 'sp-total' }, h('b', { class: this.world.score < 0 ? 'err' : 'good' }, String(this.world.score)),
+        shift ? h('span', { class: 'dim' }, `pass ${shift.passScore} · ★★ ${Math.round(shift.passScore * 1.6)} · ★★★ ${Math.round(shift.passScore * 2.4)}`) : h('span', { class: 'dim' }, 'Free play')),
+      h('div', { class: 'sp-sum' },
+        h('div', { class: 'pos' }, h('span', null, 'Earned'), h('b', null, `+${gained}`)),
+        h('div', { class: 'neg' }, h('span', null, 'Penalties'), h('b', null, String(lost)))),
+      breakdownView(this.world.scoreLog),
+    );
+    const old = this.el.querySelector('.score-pop');
+    if (old) {
+      old.remove();
+      return;
+    }
+    const cluster = anchor.closest('.tb-cluster') as HTMLElement | null;
+    if (cluster) this.scorePop.style.left = `${cluster.offsetLeft}px`;
+    togglePopover(this.el, this.scorePop, anchor);
   }
 
   private onKey(e: KeyboardEvent): void {
     if (this.host.isModalOpen()) return;
     const t = e.target as HTMLElement;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+    if (this.el.querySelector('.popover') && e.key === 'Escape') return;
     switch (e.key) {
       case ' ':
         e.preventDefault();
         this.togglePause();
-        break;
+        return;
       case 'Tab':
         e.preventDefault();
         this.swapViews();
-        break;
-      case '1': this.setCamera('tower'); break;
-      case '2': this.setCamera('orbit'); break;
-      case '3': this.setCamera('follow'); break;
-      case '4': this.setCamera('cockpit'); break;
+        return;
+      case '1': this.setCamera('tower'); return;
+      case '2': this.setCamera('orbit'); return;
+      case '3': this.setCamera('follow'); return;
+      case '4': this.setCamera('cockpit'); return;
       case '+':
       case '=':
         this.cycleSpeed(1);
-        break;
+        return;
       case '-':
         this.cycleSpeed(-1);
-        break;
+        return;
       case 'F1':
       case '?':
         e.preventDefault();
         this.host.openHelp();
-        break;
+        return;
+      case 'ArrowUp':
+      case 'ArrowDown': {
+        if (this.panel.pickerOpen) break;
+        e.preventDefault();
+        const order = this.strips.order;
+        if (!order.length) return;
+        const i = this.selected ? order.indexOf(this.selected) : -1;
+        const next = e.key === 'ArrowDown' ? (i + 1) % order.length : (i <= 0 ? order.length : i) - 1;
+        this.select(order[next]);
+        this.el.querySelector('.strip.sel')?.scrollIntoView({ block: 'nearest' });
+        return;
+      }
       case 'Escape':
         if (this.radar.pickingFix) {
           this.radar.pickingFix = false;
           this.fixResolve?.(null);
           this.fixResolve = null;
-        } else if (this.selected) this.select(null);
+        } else if (this.panel.pickerOpen) this.panel.closePicker();
+        else if (this.selected) this.select(null);
         else this.host.openPauseMenu();
-        break;
+        return;
+    }
+    if (this.selected && this.panel.handleKey(e)) {
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'n' || e.key === 'N') {
+      const bell = this.el.querySelector<HTMLElement>('.topbar [aria-label^="Notifications"]');
+      if (bell) this.notifier.toggleCenter(this.el, bell);
     }
   }
 
@@ -321,12 +428,9 @@ export class Game {
       const ok = await this.host.saveCheckpoint(this.world.snapshot(), this.summary(), beacon);
       if (ok) {
         this.dirty = false;
-        this.lastSavedAt = Date.now();
-        this.top.saved.textContent = '✓ Saved';
-        this.top.saved.className = 'tb-saved ok';
+        this.saveState = { state: 'ok', at: Date.now() };
       } else if (!urgent) {
-        this.top.saved.textContent = '⚠ Save failed';
-        this.top.saved.className = 'tb-saved bad';
+        this.saveState = { state: 'bad', at: Date.now() };
       }
     } finally {
       this.saving = false;
@@ -366,7 +470,7 @@ export class Game {
     if (this.stripT <= 0) {
       this.stripT = 0.25;
       this.updateTopBar();
-      this.updateStrips();
+      this.strips.update(w, this.selected);
     }
     this.saveT += dtReal;
     if (this.saveT >= this.host.settings.autosaveSec && this.dirty) {
@@ -374,6 +478,17 @@ export class Game {
       void this.save();
     }
   };
+
+  private updateTopBar(): void {
+    this.topbar.update(this.world, {
+      paused: this.paused,
+      timeScale: this.timeScale,
+      mode: this.host.renderer.mode,
+      radarBig: this.radarBig,
+      unread: this.notifier.unread,
+      save: this.saveState,
+    });
+  }
 
   private updateAudio(dt: number, paused: boolean): void {
     const w = this.world;
@@ -422,7 +537,7 @@ export class Game {
     const w = this.world;
     switch (e.type) {
       case 'radio': {
-        this.logRadio(e.from, e.id, e.text, !!e.urgent);
+        this.logRadio(e.from, e.id, e.text, !!e.urgent, w.t);
         const a = w.byId(e.id);
         const accent = e.from === 'atc' ? 'gb' : AIRLINE_BY_CODE[a?.airlineCode ?? '']?.voice ?? 'us';
         audio.transmit({ from: e.from, text: e.speech, voiceKey: e.from === 'atc' ? 'controller' : e.id, accent });
@@ -430,13 +545,11 @@ export class Game {
       }
       case 'score': {
         const ev = e.ev;
-        const el = h('div', { class: `sf ${ev.points >= 0 ? 'pos' : 'neg'}` }, h('b', null, `${ev.points > 0 ? '+' : ''}${ev.points}`), ` ${ev.reason}`);
-        this.scoreFeed.prepend(el);
-        while (this.scoreFeed.children.length > 5) this.scoreFeed.lastElementChild?.remove();
-        setTimeout(() => el.classList.add('fade'), 6000);
-        setTimeout(() => el.remove(), 7000);
-        if (ev.points <= -50) audio.playUI('violation');
-        else if (ev.points > 0) audio.playUI('success');
+        this.scoreFeed.add(ev);
+        if (ev.points <= -50) {
+          audio.playUI('violation');
+          this.notifier.push(`${ev.points} · ${ev.reason}`, 'bad', w.timeOfDay);
+        } else if (ev.points > 0) audio.playUI('success');
         break;
       }
       case 'touchdown': {
@@ -472,77 +585,15 @@ export class Game {
     this.host.shiftEnded(this.world);
   }
 
-  notice(text: string, level: 'info' | 'warn' | 'good' | 'bad'): void {
-    const el = h('div', { class: `notice ${level}` }, text);
-    this.notices.append(el);
-    while (this.notices.children.length > 4) this.notices.firstElementChild?.remove();
-    setTimeout(() => el.classList.add('fade'), 5000);
-    setTimeout(() => el.remove(), 6000);
+  notice(text: string, level: NoticeLevel): void {
+    this.notifier.push(text, level, this.world.timeOfDay);
   }
 
-  private logRadio(from: 'atc' | 'pilot', id: string, text: string, urgent: boolean): void {
+  private logRadio(from: 'atc' | 'pilot', id: string, text: string, urgent: boolean, simT: number, replay = false): void {
     const w = this.world;
-    const el = h('div', { class: `rl ${from}${urgent ? ' urgent' : ''}`, onclick: () => w.byId(id) && this.select(id) },
-      h('span', { class: 'rl-t' }, fmtClock(w.timeOfDay)),
-      h('span', { class: 'rl-f' }, from === 'atc' ? 'ATC' : 'PLT'),
-      h('span', { class: 'rl-x' }, text),
-    );
-    this.radioLog.append(el);
-    while (this.radioLog.children.length > 60) this.radioLog.firstElementChild?.remove();
-    this.radioLog.scrollTop = this.radioLog.scrollHeight;
-  }
-
-  private updateTopBar(): void {
-    const w = this.world;
-    const t = this.top;
-    t.clock.textContent = fmtClock(w.timeOfDay);
-    const rem = w.remaining;
-    t.remain.textContent = rem == null ? '∞' : fmtDuration(rem);
-    t.remain.parentElement!.classList.toggle('warn', rem != null && rem < 120);
-    t.atis.textContent = w.atisLetter;
-    t.atis.parentElement!.title = w.atisText();
-    t.wind.textContent = fmtWind(w.weather.windDir, w.weather.windSpeed, w.weather.gust);
-    t.rwy.textContent = `${w.arrivalEnds.join('/')} ↓ ${w.departureEnds.join('/')} ↑`;
-    t.score.textContent = String(w.score);
-    t.score.parentElement!.classList.toggle('neg', w.score < 0);
-    const mine = w.aircraft.filter((a) => a.phase !== 'parked' && a.phase !== 'exited' && !a.handedOff).length;
-    t.traffic.textContent = String(mine);
-    if (this.lastSavedAt && Date.now() - this.lastSavedAt > 4000 && t.saved.classList.contains('ok')) {
-      t.saved.textContent = `Saved ${fmtClock((new Date(this.lastSavedAt).getHours() * 3600) + new Date(this.lastSavedAt).getMinutes() * 60)}`;
-      t.saved.className = 'tb-saved dim';
-    }
-  }
-
-  private stripOrder(a: Aircraft): number {
-    if (a.emergency) return 0;
-    if (a.request) return 1;
-    return 2;
-  }
-
-  private updateStrips(): void {
-    const w = this.world;
-    const list = w.aircraft.filter((a) => a.phase !== 'exited' && a.phase !== 'parked' && !a.handedOff);
-    list.sort((a, b) => this.stripOrder(a) - this.stripOrder(b) || (a.kind === b.kind ? 0 : a.kind === 'arr' ? -1 : 1) || a.spawnT - b.spawnT);
-    const rows = list.map((a) => {
-      const alt = a.onGround ? 'GND' : fmtAltitude(a.altFt);
-      const status = a.request ? REQUEST_LABEL[a.request] : a.phase;
-      return { a, key: `${a.id}${alt}${status}${a.asgAlt}${a.id === this.selected}${w.conflictLevel(a.id)}${a.emergency}`, alt, status };
-    });
-    const key = rows.map((r) => r.key).join('|');
-    if (key === this.stripKey) return;
-    this.stripKey = key;
-    this.strips.replaceChildren(
-      ...rows.map(({ a, alt, status }) => {
-        const lvl = w.conflictLevel(a.id);
-        const cls = ['strip', a.kind, a.id === this.selected ? 'sel' : '', a.request ? 'req' : '', a.emergency ? 'emerg' : '', lvl ? `c-${lvl}` : ''].join(' ');
-        return h('div', { class: cls, onclick: () => this.select(a.id) },
-          h('div', { class: 's1' }, h('b', null, a.callsign), h('span', null, `${a.type.icao}/${a.type.wake}`)),
-          h('div', { class: 's2' }, h('span', null, alt), h('span', null, a.onGround ? (a.gate ?? a.rwyEnd ?? '') : `→${fmtAltitude(a.asgAlt)}`)),
-          h('div', { class: 's3' }, status),
-        );
-      }),
-    );
-    if (!rows.length) this.strips.append(h('div', { class: 'strip-empty' }, 'No active traffic.'));
+    const a: Aircraft | undefined = w.byId(id);
+    const pos: CommsEntry['pos'] = !a ? 'APP' : a.onGround && !TOWER_PHASES.has(a.phase) ? 'GND' : TOWER_PHASES.has(a.phase) ? 'TWR' : 'APP';
+    this.comms.add({ t: w.cfg.startHour * 3600 + simT, from, id, callsign: a?.callsign ?? id, text, urgent, pos }, replay);
   }
 
   private updateLabels(): void {
@@ -553,11 +604,12 @@ export class Game {
     this.labels.style.display = '';
     const r = this.host.renderer;
     const w = this.world;
+    const maxD = this.host.settings.labelDistance || 25000;
     let n = 0;
     for (const a of w.aircraft) {
       if (a.phase === 'exited' || a.id === r.following && (r.mode === 'cockpit' || r.mode === 'follow')) continue;
       const p = r.project(a.x, a.y, a.altFt + (a.type.height + 8) / 0.3048);
-      if (!p || p.d > 25000) continue;
+      if (!p || p.d > maxD) continue;
       let el = this.labelPool[n];
       if (!el) {
         el = h('div', { class: 'lbl' });
@@ -571,8 +623,8 @@ export class Game {
       if (el.textContent !== txt) el.textContent = txt;
       el.style.transform = `translate(${Math.round(p.x)}px, ${Math.round(p.y)}px) translate(-50%, -100%)`;
       el.style.display = '';
-      el.className = `lbl${a.id === this.selected ? ' sel' : ''}${this.attention.has(a.id) ? ' req' : ''}${w.conflictLevel(a.id) === 'loss' ? ' loss' : ''}`;
-      el.style.opacity = String(Math.max(0.35, 1 - p.d / 25000));
+      el.className = `lbl ${a.kind}${a.id === this.selected ? ' sel' : ''}${this.attention.has(a.id) ? ' req' : ''}${a.emergency ? ' emerg' : ''}${w.conflictLevel(a.id) === 'loss' ? ' loss' : ''}`;
+      el.style.opacity = String(Math.max(0.35, 1 - p.d / maxD));
     }
     for (let i = n; i < this.labelPool.length; i++) this.labelPool[i].style.display = 'none';
   }

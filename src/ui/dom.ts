@@ -33,3 +33,42 @@ export function fmtDuration(sec: number): string {
 export function fmtDate(ms: number): string {
   return new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
+
+const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** Keeps Tab focus inside `root` and focuses its preferred control. Returns a release function that restores focus. */
+export function trapFocus(root: HTMLElement): () => void {
+  const prev = document.activeElement as HTMLElement | null;
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.key !== 'Tab') return;
+    const els = [...root.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.offsetParent !== null);
+    if (!els.length) return;
+    const first = els[0];
+    const last = els[els.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    } else if (!root.contains(document.activeElement)) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+  root.addEventListener('keydown', onKey);
+  setTimeout(() => {
+    const target = root.querySelector<HTMLElement>('[autofocus], input[type=text], .btn.primary') ?? root.querySelector<HTMLElement>(FOCUSABLE);
+    target?.focus({ preventScroll: true });
+  }, 0);
+  return () => {
+    root.removeEventListener('keydown', onKey);
+    if (prev?.isConnected) prev.focus({ preventScroll: true });
+  };
+}
+
+/** Initials for an avatar, e.g. "Moshe Harary" → "MH". */
+export function initials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  return ((parts[0]?.[0] ?? '?') + (parts.length > 1 ? parts[parts.length - 1][0] : '')).toUpperCase();
+}

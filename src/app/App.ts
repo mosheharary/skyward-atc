@@ -8,10 +8,15 @@ import { createAudioEngine } from '../audio';
 import type { IAudioEngine } from '../audio/contracts';
 import { Game, type GameHost } from './Game';
 import { HelpDialog } from '../ui/help';
-import { api, DEFAULT_SETTINGS, type CheckpointSummary, type Profile, type ProfileSummary, type Settings } from '../ui/api';
-import { h, fmtDate, fmtDuration } from '../ui/dom';
+import { api, DEFAULT_SETTINGS, type CheckpointSummary, type Profile, type ProfileSummary, type ResultInfo, type Settings } from '../ui/api';
+import { h, fmtDate, fmtDuration, trapFocus, initials } from '../ui/dom';
+import { icon } from '../ui/icons';
+import { applyUiPrefs } from '../ui/prefs';
+import { breakdownView } from '../ui/notifications';
 
 const PROFILE_KEY = 'skyward.profile';
+
+type ModalEl = HTMLElement & { onClose?: () => void; closable?: boolean; release?: () => void };
 
 export class App implements GameHost {
   readonly renderer: GameRenderer;
@@ -23,15 +28,18 @@ export class App implements GameHost {
   private readonly help: HelpDialog;
   private profile: Profile | null = null;
   private game: Game | null = null;
-  private modals: HTMLElement[] = [];
+  private modals: ModalEl[] = [];
   private readonly toastEl: HTMLElement;
+  private saveSettingsT = 0;
+  private version = '';
 
   constructor(root: HTMLElement) {
     this.root = root;
     this.screen = h('div', { class: 'screen-host' });
     this.modalLayer = h('div', { class: 'modal-layer' });
-    this.toastEl = h('div', { class: 'toast hidden' });
+    this.toastEl = h('div', { class: 'toast hidden', role: 'status', 'aria-live': 'polite' });
     root.append(this.screen, this.modalLayer, this.toastEl);
+    applyUiPrefs(this.settings);
     const canvas = document.createElement('canvas');
     canvas.className = 'gl';
     this.renderer = new GameRenderer(canvas, this.settings.quality);
@@ -49,19 +57,22 @@ export class App implements GameHost {
     // Expose a small hook for automated verification.
     (window as unknown as { skyward: unknown }).skyward = this;
     window.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && this.modals.length && !this.help.isOpen) {
-        e.stopImmediatePropagation();
-        this.closeTopModal();
-      } else if (e.key === 'Escape' && this.help.isOpen) {
+      if (e.key !== 'Escape') return;
+      // Help is re-appended on open, so when it is visible it is always the top-most dialog.
+      if (this.help.isOpen) {
         e.stopImmediatePropagation();
         this.help.close();
+      } else if (this.modals.length) {
+        e.stopImmediatePropagation();
+        this.closeTopModal();
       }
     }, { capture: true });
   }
 
   async start(): Promise<void> {
     try {
-      await api.health();
+      const hl = await api.health();
+      this.version = hl.version ?? '';
     } catch {
       this.show(h('div', { class: 'menu' }, h('h1', null, 'Skyward ATC'), h('p', { class: 'err' }, 'Cannot reach the game server. Is the container running?')));
       return;
@@ -100,6 +111,19 @@ export class App implements GameHost {
     return this.modals.length > 0 || this.help.isOpen;
   }
 
+  updateSettings(patch: Partial<Settings>): void {
+    this.settings = { ...this.settings, ...patch };
+    this.applySettings();
+    clearTimeout(this.saveSettingsT);
+    this.saveSettingsT = window.setTimeout(() => this.persistSettings(), 800);
+  }
+
+  private persistSettings(): void {
+    if (!this.profile) return;
+    this.profile.settings = this.settings;
+    void api.saveSettings(this.profile.id, this.settings).catch(() => this.toast('Could not save settings', true));
+  }
+
   // ------------------------------------------------------------ helpers
   private show(el: HTMLElement): void {
     this.screen.replaceChildren(el);
@@ -112,31 +136,35 @@ export class App implements GameHost {
     (this.toastEl as unknown as { t: number }).t = window.setTimeout(() => this.toastEl.classList.add('hidden'), 3500);
   }
 
-  private modal(title: string, body: HTMLElement | HTMLElement[], opts: { wide?: boolean; onClose?: () => void; closable?: boolean } = {}): HTMLElement {
+  private modal(title: string, body: HTMLElement | HTMLElement[], opts: { wide?: boolean; onClose?: () => void; closable?: boolean; icon?: string; cls?: string } = {}): ModalEl {
     const close = (): void => this.closeModal(m);
-    const m = h('div', { class: 'modal' },
-      h('div', { class: `modal-card${opts.wide ? ' wide' : ''}` },
-        h('div', { class: 'modal-head' }, h('h2', null, title), opts.closable === false ? null : h('button', { class: 'close', 'aria-label': 'Close', onclick: close }, '✕')),
+    const m: ModalEl = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
+      h('div', { class: `modal-card${opts.wide ? ' wide' : ''}${opts.cls ? ` ${opts.cls}` : ''}` },
+        h('div', { class: 'modal-head' }, h('h2', null, opts.icon ? icon(opts.icon) : '', title), opts.closable === false ? null : h('button', { class: 'close', 'aria-label': 'Close', title: 'Close (Esc)', onclick: close }, icon('close'))),
         h('div', { class: 'modal-body' }, ...(Array.isArray(body) ? body : [body])),
       ),
     );
-    (m as unknown as { onClose?: () => void }).onClose = opts.onClose;
-    (m as unknown as { closable: boolean }).closable = opts.closable !== false;
+    m.onClose = opts.onClose;
+    m.closable = opts.closable !== false;
+    // A new dialog always goes on top of Help, too.
+    if (this.help.isOpen) this.help.close();
     this.modalLayer.append(m);
     this.modals.push(m);
+    m.release = trapFocus(m);
     return m;
   }
 
-  private closeModal(m: HTMLElement): void {
+  private closeModal(m: ModalEl): void {
     const i = this.modals.indexOf(m);
     if (i >= 0) this.modals.splice(i, 1);
     m.remove();
-    (m as unknown as { onClose?: () => void }).onClose?.();
+    m.release?.();
+    m.onClose?.();
   }
 
   private closeTopModal(): void {
     const m = this.modals[this.modals.length - 1];
-    if (m && (m as unknown as { closable: boolean }).closable) this.closeModal(m);
+    if (m && m.closable) this.closeModal(m);
   }
 
   private confirm(title: string, text: string, ok = 'OK', danger = false): Promise<boolean> {
@@ -148,7 +176,7 @@ export class App implements GameHost {
           h('button', { class: 'btn', onclick: () => { done = true; this.closeModal(m); res(false); } }, 'Cancel'),
           h('button', { class: `btn ${danger ? 'danger' : 'primary'}`, onclick: () => { done = true; this.closeModal(m); res(true); } }, ok),
         ),
-      ], { onClose: () => !done && res(false) });
+      ], { onClose: () => !done && res(false), icon: danger ? 'alert' : 'info' });
     });
   }
 
@@ -168,16 +196,21 @@ export class App implements GameHost {
           h('button', { class: 'btn', onclick: () => { done = true; this.closeModal(m); res(null); } }, 'Cancel'),
           h('button', { class: 'btn primary', onclick: submit }, 'OK'),
         ),
-      ], { onClose: () => !done && res(null) });
+      ], { onClose: () => !done && res(null), icon: 'save' });
       setTimeout(() => input.select(), 0);
     });
   }
 
   private menuShell(...children: (HTMLElement | null)[]): HTMLElement {
+    const blips = Array.from({ length: 7 }, (_, i) => h('span', { class: 'blip', style: `left:${12 + ((i * 37) % 76)}%;top:${14 + ((i * 53) % 70)}%` }));
     return h('div', { class: 'menu-screen' },
-      h('div', { class: 'menu-bg' }),
+      h('div', { class: 'menu-bg', 'aria-hidden': 'true' }, h('div', { class: 'sweep' }), ...blips),
       h('div', { class: 'menu' },
-        h('div', { class: 'brand' }, h('div', { class: 'logo' }, '◈'), h('div', null, h('h1', null, 'Skyward ATC'), h('div', { class: 'tag' }, 'Approach · Tower · Ground'))),
+        h('div', { class: 'brand' },
+          h('div', { class: 'logo' }, icon('logo')),
+          h('div', null, h('h1', null, 'Skyward ATC'), h('div', { class: 'tag' }, 'Approach · Tower · Ground')),
+          this.version ? h('span', { class: 'chip ver' }, `v${this.version}`) : null,
+        ),
         ...children,
       ),
     );
@@ -202,11 +235,12 @@ export class App implements GameHost {
     };
     input.addEventListener('keydown', (e) => e.key === 'Enter' && void create());
     this.show(this.menuShell(
-      h('h2', null, 'Choose your controller profile'),
+      h('h2', null, list.length ? 'Choose your controller profile' : 'Create your controller profile'),
       h('div', { class: 'profile-list' },
         ...list.map((p) =>
           h('div', { class: 'profile' },
             h('button', { class: 'profile-main', onclick: () => void this.useProfile(p.id) },
+              h('span', { class: 'avatar sm' }, initials(p.name)),
               h('b', null, p.name),
               h('span', null, p.careerSummary ?? 'New controller'),
               h('small', null, p.checkpoint ? `Checkpoint: ${p.checkpoint.title} · ${fmtDate(p.checkpoint.savedAt)}` : `Last played ${fmtDate(p.lastPlayedAt)}`),
@@ -219,11 +253,11 @@ export class App implements GameHost {
                   void this.showProfiles();
                 }
               },
-            }, '🗑'),
+            }, icon('trash')),
           ),
         ),
       ),
-      h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: () => void create() }, 'Create profile')),
+      h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: () => void create() }, icon('user'), 'Create profile')),
     ));
     setTimeout(() => input.focus(), 0);
   }
@@ -242,6 +276,7 @@ export class App implements GameHost {
   }
 
   private applySettings(): void {
+    applyUiPrefs(this.settings);
     this.audio.setVolumes({ master: this.settings.master, engines: this.settings.engines, radio: this.settings.radio, ambience: this.settings.ambience, music: this.settings.music, ui: this.settings.ui });
     this.audio.setVoiceEnabled(this.settings.pilotVoices, this.settings.controllerVoice);
     if (this.renderer.quality !== this.settings.quality) this.renderer.setQuality(this.settings.quality);
@@ -253,67 +288,113 @@ export class App implements GameHost {
     const p = this.profile!;
     this.audio.setMusic('menu');
     let cp: CheckpointSummary | null = null;
+    let results: ResultInfo[] = [];
     try {
-      const all = await api.profiles();
+      const [all, res] = await Promise.all([api.profiles(), api.results(p.id).catch(() => [] as ResultInfo[])]);
       cp = all.find((x) => x.id === p.id)?.checkpoint ?? null;
+      results = res;
     } catch {
       /* offline */
     }
     const c = this.career;
     const stars = Object.values(c.best).reduce((s, b) => s + b.stars, 0);
+    const done = Object.keys(c.best).length;
+    const pct = Math.round((Math.min(c.unlocked - 1, SHIFTS.length) / SHIFTS.length) * 100);
+    const recent = [...results].sort((a, b) => b.completedAt - a.completedAt).slice(0, 6);
     this.show(this.menuShell(
-      h('div', { class: 'welcome' }, `Welcome back, `, h('b', null, p.name), h('span', { class: 'dim' }, ` · Career ${Math.min(c.unlocked, SHIFTS.length)}/${SHIFTS.length} · ${stars}★`)),
-      h('div', { class: 'menu-buttons' },
-        cp ? h('button', { class: 'big primary', id: 'btn-continue', onclick: () => void this.continueCheckpoint() },
-          h('b', null, '▶ Continue'),
-          h('span', null, `${cp.title} · score ${cp.score}${cp.remaining != null ? ` · ${fmtDuration(cp.remaining)} left` : ''}`),
-          h('small', null, `Saved ${fmtDate(cp.savedAt)}`),
-        ) : null,
-        h('button', { class: 'big', id: 'btn-career', onclick: () => this.showCareer() }, h('b', null, 'Career'), h('span', null, '10 shifts across three airports')),
-        h('button', { class: 'big', id: 'btn-free', onclick: () => this.showFreePlay() }, h('b', null, 'Free play'), h('span', null, 'Your airport, traffic and weather')),
-        h('div', { class: 'row' },
-          h('button', { class: 'btn', onclick: () => void this.showLoad() }, 'Load game'),
-          h('button', { class: 'btn', onclick: () => this.showSettings() }, 'Settings'),
-          h('button', { class: 'btn', id: 'btn-help', onclick: () => this.openHelp() }, 'Help'),
-          h('button', { class: 'btn', onclick: () => { localStorage.removeItem(PROFILE_KEY); this.profile = null; void this.showProfiles(); } }, 'Switch profile'),
+      h('div', { class: 'welcome' },
+        h('span', { class: 'avatar' }, initials(p.name)),
+        h('div', { class: 'who' }, h('div', null, 'Welcome back'), h('b', null, p.name)),
+      ),
+      h('div', { class: 'menu-grid' },
+        h('div', { class: 'menu-buttons' },
+          cp ? h('button', { class: 'big primary', id: 'btn-continue', onclick: () => void this.continueCheckpoint() },
+            icon('play'),
+            h('b', null, 'Continue'),
+            h('span', null, `${cp.title} · score ${cp.score}${cp.remaining != null ? ` · ${fmtDuration(cp.remaining)} left` : ''}`),
+            h('small', null, `Saved ${fmtDate(cp.savedAt)}`),
+            icon('chevronRight', 'go'),
+          ) : null,
+          h('button', { class: `big${cp ? '' : ' primary'}`, id: 'btn-career', onclick: () => this.showCareer() },
+            icon('career'), h('b', null, 'Career'), h('span', null, `${SHIFTS.length} shifts across three airports`), h('small', null, `Shift ${Math.min(c.unlocked, SHIFTS.length)} unlocked`), icon('chevronRight', 'go')),
+          h('button', { class: 'big', id: 'btn-free', onclick: () => this.showFreePlay() },
+            icon('sliders'), h('b', null, 'Free play'), h('span', null, 'Your airport, traffic and weather'), h('small', null, `${AIRPORTS.length} airports · 6 weather presets`), icon('chevronRight', 'go')),
+        ),
+        h('div', { class: 'menu-side' },
+          h('div', { class: 'card career-card' },
+            h('h3', null, 'Career progress', h('span', { class: 'stars' }, `${stars}★`)),
+            h('div', { class: 'big-num' }, `${Math.min(c.unlocked, SHIFTS.length)}`, h('small', null, ` / ${SHIFTS.length} shifts`)),
+            h('div', { class: 'bar' }, h('i', { style: `width:${pct}%` })),
+            h('div', { class: 'dim' }, `${done} completed · ${stars} of ${SHIFTS.length * 3} stars`),
+          ),
+          h('div', { class: 'card' },
+            h('h3', null, 'Recent shifts'),
+            recent.length
+              ? h('div', { class: 'results-list' }, ...recent.map((r) => {
+                const s = SHIFT_BY_ID[r.shiftId];
+                return h('div', { class: 'res' },
+                  h('span', null, s ? `${s.index}. ${s.title}` : r.shiftId, h('small', null, `${r.airport} · ${fmtDate(r.completedAt)}`)),
+                  h('span', { class: 'num' }, String(r.score)),
+                  h('span', { class: 'st' }, '★'.repeat(r.stars) + '☆'.repeat(3 - r.stars)));
+              }))
+              : h('div', { class: 'dim' }, 'No completed shifts yet. Start your career!'),
+          ),
         ),
       ),
-      h('div', { class: 'footer dim' }, 'Your progress is saved automatically on the server.'),
+      h('div', { class: 'menu-tools' },
+        h('button', { class: 'btn', onclick: () => void this.showLoad() }, icon('folder'), 'Load game'),
+        h('button', { class: 'btn', onclick: () => this.showSettings() }, icon('gear'), 'Settings'),
+        h('button', { class: 'btn', id: 'btn-help', onclick: () => this.openHelp() }, icon('help'), 'Help'),
+        h('button', { class: 'btn', onclick: () => { localStorage.removeItem(PROFILE_KEY); this.profile = null; void this.showProfiles(); } }, icon('users'), 'Switch profile'),
+      ),
+      h('div', { class: 'footer dim' }, icon('save'), 'Your progress is saved automatically on the server.'),
     ));
   }
 
   private showCareer(): void {
     const c = this.career;
     const detail = h('div', { class: 'shift-detail' });
+    const buttons = new Map<string, HTMLElement>();
     const pick = (id: string): void => {
       const s = SHIFT_BY_ID[id];
       const ap = AIRPORT_BY_ID[s.airport];
       const best = c.best[s.id];
       const locked = s.index > c.unlocked;
+      for (const [k, b] of buttons) b.classList.toggle('active', k === id);
+      const fact = (label: string, value: string): HTMLElement => h('div', null, h('b', null, value), h('span', null, label));
       detail.replaceChildren(
         h('h3', null, `Shift ${s.index} — ${s.title}`),
-        h('div', { class: 'dim' }, `${ap.name} (${ap.icao}) · ${s.config.durationMin} min · ${s.config.arrivalsPerHour} arr/h · ${s.config.departuresPerHour} dep/h · ${s.config.weather}`),
+        h('div', { class: 'dim' }, `${ap.name} (${ap.icao})`),
+        h('div', { class: 'shift-facts' },
+          fact('Duration', `${s.config.durationMin} min`), fact('Arrivals', `${s.config.arrivalsPerHour}/h`), fact('Departures', `${s.config.departuresPerHour}/h`),
+          fact('Weather', s.config.weather), fact('Start', `${String(s.config.startHour).padStart(2, '0')}:00`), fact('Emergencies', s.config.emergencyRate ? 'possible' : 'none'),
+        ),
         h('p', null, s.briefing),
-        h('p', { class: 'tip' }, `💡 ${s.tip}`),
-        h('div', { class: 'dim' }, `Pass: ${s.passScore} pts · ★★ ${Math.round(s.passScore * 1.6)} · ★★★ ${Math.round(s.passScore * 2.4)} · Fails below ${s.failScore}`),
-        best ? h('div', null, `Best: ${best.score} pts ${'★'.repeat(best.stars)}${'☆'.repeat(3 - best.stars)}`) : '',
-        h('button', { class: 'btn primary', id: 'btn-start-shift', disabled: locked ? '' : null, onclick: () => void this.startSession(shiftSession(s, (Math.random() * 2 ** 31) >>> 0)) }, locked ? '🔒 Locked' : 'Start shift'),
+        h('p', { class: 'tip' }, icon('info'), h('span', null, s.tip)),
+        h('div', { class: 'targets' },
+          h('span', null, 'Pass ', h('b', null, String(s.passScore))), h('span', null, '★★ ', h('b', null, String(Math.round(s.passScore * 1.6)))),
+          h('span', null, '★★★ ', h('b', null, String(Math.round(s.passScore * 2.4)))), h('span', null, 'Fails below ', h('b', null, String(s.failScore)))),
+        best ? h('p', null, `Best: ${best.score} pts `, h('span', { class: 'k amber' }, `${'★'.repeat(best.stars)}${'☆'.repeat(3 - best.stars)}`)) : '',
+        h('button', { class: 'btn primary big-btn', id: 'btn-start-shift', disabled: locked ? '' : null, onclick: () => void this.startSession(shiftSession(s, (Math.random() * 2 ** 31) >>> 0)) },
+          locked ? icon('lock') : icon('play'), locked ? 'Locked' : 'Start shift'),
       );
     };
     const list = h('div', { class: 'shift-list' },
       ...SHIFTS.map((s) => {
         const b = c.best[s.id];
         const locked = s.index > c.unlocked;
-        return h('button', { class: `shift${locked ? ' locked' : ''}`, onclick: () => pick(s.id) },
+        const el = h('button', { class: `shift${locked ? ' locked' : ''}`, onclick: () => pick(s.id) },
           h('span', { class: 'n' }, String(s.index)),
-          h('span', { class: 't' }, s.title, h('small', null, AIRPORT_BY_ID[s.airport].icao)),
-          h('span', { class: 'st' }, locked ? '🔒' : b ? '★'.repeat(b.stars) + '☆'.repeat(3 - b.stars) : '☆☆☆'),
+          h('span', { class: 't' }, s.title, h('small', null, `${AIRPORT_BY_ID[s.airport].icao} · ${s.config.durationMin} min`)),
+          h('span', { class: 'st' }, locked ? icon('lock') : b ? '★'.repeat(b.stars) + '☆'.repeat(3 - b.stars) : '☆☆☆'),
         );
+        buttons.set(s.id, el);
+        return el;
       }),
     );
     pick(SHIFTS[Math.min(c.unlocked, SHIFTS.length) - 1].id);
     this.show(this.menuShell(
-      h('div', { class: 'row between' }, h('h2', null, 'Career'), h('button', { class: 'btn', onclick: () => void this.showMainMenu() }, '← Back')),
+      h('div', { class: 'row between' }, h('h2', null, 'Career'), h('button', { class: 'btn', onclick: () => void this.showMainMenu() }, icon('chevronLeft'), 'Back')),
       h('div', { class: 'career' }, list, detail),
     ));
   }
@@ -349,13 +430,13 @@ export class App implements GameHost {
       void this.startSession(cfg);
     };
     this.show(this.menuShell(
-      h('div', { class: 'row between' }, h('h2', null, 'Free play'), h('button', { class: 'btn', onclick: () => void this.showMainMenu() }, '← Back')),
+      h('div', { class: 'row between' }, h('h2', null, 'Free play'), h('button', { class: 'btn', onclick: () => void this.showMainMenu() }, icon('chevronLeft'), 'Back')),
       h('div', { class: 'form-grid' },
         field('Airport', airport), field('Runways', cfgSel), field('Traffic', traffic), field('Weather', weather),
         field('Time of day', hour), field('Session length', dur), field('Emergencies', emerg),
       ),
       desc,
-      h('button', { class: 'btn primary big-btn', id: 'btn-start-free', onclick: start }, 'Start session'),
+      h('button', { class: 'btn primary big-btn', id: 'btn-start-free', onclick: start }, icon('play'), 'Start session'),
     ));
   }
 
@@ -379,13 +460,13 @@ export class App implements GameHost {
       this.game!.togglePause(true);
       const m = this.modal(`Shift ${s.index}: ${s.title}`, [
         h('p', null, s.briefing),
-        h('p', { class: 'tip' }, `💡 ${s.tip}`),
+        h('p', { class: 'tip' }, icon('info'), h('span', null, s.tip)),
         h('p', { class: 'dim' }, `Target: ${s.passScore} points in ${s.config.durationMin} minutes. New to the job? Press F1 for help at any time.`),
         h('div', { class: 'row end' },
-          h('button', { class: 'btn', onclick: () => this.openHelp('start') }, 'How to play'),
-          h('button', { class: 'btn primary', id: 'btn-begin', onclick: () => this.closeModal(m) }, 'Begin shift'),
+          h('button', { class: 'btn', onclick: () => this.openHelp('start') }, icon('help'), 'How to play'),
+          h('button', { class: 'btn primary', id: 'btn-begin', onclick: () => this.closeModal(m) }, icon('play'), 'Begin shift'),
         ),
-      ], { onClose: () => this.game?.togglePause(false) });
+      ], { onClose: () => this.game?.togglePause(false), icon: 'career' });
     }
     void this.game?.save();
   }
@@ -407,8 +488,8 @@ export class App implements GameHost {
       const m = this.modal('Welcome back', [
         h('p', null, `${cp.summary.title}. Score ${cp.summary.score}${cp.summary.remaining != null ? `, ${fmtDuration(cp.summary.remaining)} remaining` : ''}.`),
         h('p', { class: 'dim' }, 'The simulation is paused exactly where you left it.'),
-        h('div', { class: 'row end' }, h('button', { class: 'btn primary', id: 'btn-resume', onclick: () => this.closeModal(m) }, 'Resume')),
-      ], { onClose: () => this.game?.togglePause(false) });
+        h('div', { class: 'row end' }, h('button', { class: 'btn primary', id: 'btn-resume', onclick: () => this.closeModal(m) }, icon('play'), 'Resume')),
+      ], { onClose: () => this.game?.togglePause(false), icon: 'play' });
     } catch (e) {
       this.toast(`Could not load the checkpoint: ${(e as Error).message}`, true);
     }
@@ -444,10 +525,10 @@ export class App implements GameHost {
                 void this.showLoad();
               }
             },
-          }, '🗑'),
+          }, icon('trash')),
         )) : [h('p', { class: 'dim' }, 'No saved games yet. Use "Save game" in the pause menu while playing.')]),
     );
-    const m = this.modal('Load game', body, { wide: true });
+    const m = this.modal('Load game', body, { wide: true, icon: 'folder' });
   }
 
   openPauseMenu(): void {
@@ -455,25 +536,35 @@ export class App implements GameHost {
     if (!g || this.isModalOpen()) return;
     const wasPaused = g.paused;
     g.togglePause(true);
-    const m = this.modal('Paused', h('div', { class: 'pause-menu' },
-      h('button', { class: 'btn primary', onclick: () => this.closeModal(m) }, 'Resume'),
-      h('button', {
-        class: 'btn', id: 'btn-save', onclick: async () => {
-          const label = await this.prompt('Save game', 'Name', `${g.summary().title} · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
-          if (label == null || !this.profile) return;
-          try {
-            await api.createSave(this.profile.id, label, g.world.snapshot(), g.summary());
-            this.toast(`Saved "${label}"`);
-          } catch (e) {
-            this.toast((e as Error).message, true);
-          }
-        },
-      }, 'Save game'),
-      h('button', { class: 'btn', onclick: () => void this.showLoad() }, 'Load game'),
-      h('button', { class: 'btn', onclick: () => this.showSettings() }, 'Settings'),
-      h('button', { class: 'btn', onclick: () => this.openHelp() }, 'Help'),
-      h('button', { class: 'btn danger', id: 'btn-exit', onclick: () => void this.exitToMenu() }, 'Save & exit to menu'),
-    ), { onClose: () => this.game && this.game.togglePause(wasPaused) });
+    const w = g.world;
+    const rem = w.remaining;
+    const mine = w.aircraft.filter((a) => a.phase !== 'parked' && a.phase !== 'exited' && !a.handedOff).length;
+    const m = this.modal('Paused', [
+      h('div', { class: 'pause-stats' },
+        h('div', null, h('span', null, 'Score'), h('b', { class: w.score < 0 ? 'err' : 'good' }, String(w.score))),
+        h('div', null, h('span', null, 'Time left'), h('b', null, rem == null ? '∞' : fmtDuration(rem))),
+        h('div', null, h('span', null, 'Traffic'), h('b', null, String(mine))),
+      ),
+      h('div', { class: 'pause-menu' },
+        h('button', { class: 'btn primary', onclick: () => this.closeModal(m) }, icon('play'), 'Resume', h('kbd', null, 'Esc')),
+        h('button', {
+          class: 'btn', id: 'btn-save', onclick: async () => {
+            const label = await this.prompt('Save game', 'Name', `${g.summary().title} · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+            if (label == null || !this.profile) return;
+            try {
+              await api.createSave(this.profile.id, label, g.world.snapshot(), g.summary());
+              this.toast(`Saved "${label}"`);
+            } catch (e) {
+              this.toast((e as Error).message, true);
+            }
+          },
+        }, icon('save'), 'Save game'),
+        h('button', { class: 'btn', onclick: () => void this.showLoad() }, icon('folder'), 'Load game'),
+        h('button', { class: 'btn', onclick: () => this.showSettings() }, icon('gear'), 'Settings'),
+        h('button', { class: 'btn', onclick: () => this.openHelp() }, icon('help'), 'Help', h('kbd', null, 'F1')),
+        h('button', { class: 'btn danger', id: 'btn-exit', onclick: () => void this.exitToMenu() }, icon('exit'), 'Save & exit to menu'),
+      ),
+    ], { onClose: () => this.game && this.game.togglePause(wasPaused), icon: 'pause' });
   }
 
   private async exitToMenu(): Promise<void> {
@@ -511,80 +602,160 @@ export class App implements GameHost {
         void api.postResult(p.id, { shiftId: s.id, airport: world.cfg.airport, score: world.score, stars, stats: st });
       }
     }
-    const row = (k: string, v: string | number): HTMLElement => h('tr', null, h('td', null, k), h('td', null, String(v)));
+    const tile = (ic: string, label: string, v: number, bad = false): HTMLElement => h('div', { class: bad && v > 0 ? 'bad' : '' }, icon(ic), h('b', null, String(v)), h('span', null, label));
     const title = world.ended === 'failed' ? 'Shift failed' : s ? (passed ? 'Shift complete' : 'Shift over — target missed') : 'Session complete';
     const m = this.modal(title, [
-      s ? h('div', { class: 'stars-big' }, '★'.repeat(stars) + '☆'.repeat(3 - stars)) : null,
+      s ? h('div', { class: 'stars-big', 'aria-label': `${stars} of 3 stars` },
+        ...[0, 1, 2].map((i) => h('span', { class: i < stars ? '' : 'off', style: `animation-delay:${0.25 + i * 0.35}s` }, i < stars ? '★' : '☆'))) : null,
       h('div', { class: 'final-score' }, `${world.score} points`),
+      s ? h('div', { class: 'final-sub' }, `Pass ${s.passScore} · ★★ ${Math.round(s.passScore * 1.6)} · ★★★ ${Math.round(s.passScore * 2.4)}`) : null,
       world.ended === 'failed' ? h('p', { class: 'err' }, 'The score dropped below the failure threshold: the supervisor relieved you from the position.') : null,
       unlockedNext ? h('p', { class: 'good' }, `Shift ${s!.index + 1} unlocked!`) : null,
-      h('table', { class: 'stats' },
-        row('Landed', st.landed), row('Departed', st.departed), row('Parked', st.parked), row('Go-arounds', st.goArounds),
-        row('Separation losses', st.separationLosses), row('Runway incursions', st.incursions), row('Emergencies', st.emergencies), row('Instructions given', st.commands),
+      h('div', { class: 'results-grid' },
+        tile('land', 'Landed', st.landed), tile('takeoff', 'Departed', st.departed), tile('ground', 'Parked', st.parked), tile('goaround', 'Go-arounds', st.goArounds, true),
+        tile('alert', 'Separation', st.separationLosses, true), tile('runway', 'Incursions', st.incursions, true), tile('emergency', 'Emergencies', st.emergencies), tile('radio', 'Instructions', st.commands),
       ),
+      h('div', { class: 'sec-title' }, 'Score breakdown'),
+      breakdownView(world.scoreLog),
       h('div', { class: 'row end' },
-        s ? h('button', { class: 'btn', onclick: () => { this.closeModal(m); void this.startSession(shiftSession(s, (Math.random() * 2 ** 31) >>> 0)); } }, 'Retry') : null,
-        s && unlockedNext ? h('button', { class: 'btn primary', onclick: () => { this.closeModal(m); void this.startSession(shiftSession(SHIFTS[s.index], (Math.random() * 2 ** 31) >>> 0)); } }, 'Next shift') : null,
-        h('button', { class: 'btn', id: 'btn-menu', onclick: () => { this.game?.dispose(); this.game = null; this.closeModal(m); void this.showMainMenu(); } }, 'Main menu'),
+        s ? h('button', { class: 'btn', onclick: () => { this.closeModal(m); void this.startSession(shiftSession(s, (Math.random() * 2 ** 31) >>> 0)); } }, icon('goaround'), 'Retry') : null,
+        s && unlockedNext ? h('button', { class: 'btn primary', onclick: () => { this.closeModal(m); void this.startSession(shiftSession(SHIFTS[s.index], (Math.random() * 2 ** 31) >>> 0)); } }, icon('play'), 'Next shift') : null,
+        h('button', { class: 'btn', id: 'btn-menu', onclick: () => { this.game?.dispose(); this.game = null; this.closeModal(m); void this.showMainMenu(); } }, icon('home'), 'Main menu'),
       ),
-    ].filter(Boolean) as HTMLElement[], { closable: false });
+    ].filter(Boolean) as HTMLElement[], { closable: false, wide: true, icon: passed ? 'star' : 'alert' });
   }
 
   // ------------------------------------------------------------ settings
   showSettings(): void {
-    const s = { ...this.settings };
-    const slider = (key: keyof Settings, label: string): HTMLElement => {
-      const out = h('output', null, `${Math.round((s[key] as number) * 100)}%`);
-      return h('label', { class: 'field slider' }, h('span', null, label),
-        h('input', {
-          type: 'range', min: '0', max: '1', step: '0.05', value: String(s[key]),
-          oninput: (e: Event) => {
-            (s as Record<string, unknown>)[key] = Number((e.target as HTMLInputElement).value);
-            out.textContent = `${Math.round((s[key] as number) * 100)}%`;
-            this.settings = { ...s };
-            this.applySettings();
-          },
-        }), out);
+    const set = (patch: Partial<Settings>): void => {
+      this.settings = { ...this.settings, ...patch };
+      this.applySettings();
     };
-    const check = (key: keyof Settings, label: string): HTMLElement =>
-      h('label', { class: 'check' }, h('input', {
-        type: 'checkbox', checked: s[key] ? '' : null, onchange: (e: Event) => {
-          (s as Record<string, unknown>)[key] = (e.target as HTMLInputElement).checked;
-          this.settings = { ...s };
-          this.applySettings();
+    const opt = (label: string, hint: string, control: HTMLElement): HTMLElement =>
+      h('label', { class: 'opt' }, h('span', null, h('b', null, label), hint ? h('small', null, hint) : ''), control);
+    const range = (key: keyof Settings, label: string, hint: string, min: number, max: number, step: number, fmt: (v: number) => string): HTMLElement => {
+      const out = h('output', null, fmt(this.settings[key] as number));
+      return opt(label, hint, h('span', { class: 'rng' },
+        h('input', {
+          type: 'range', min: String(min), max: String(max), step: String(step), value: String(this.settings[key]), 'aria-label': label,
+          oninput: (e: Event) => {
+            const v = Number((e.target as HTMLInputElement).value);
+            out.textContent = fmt(v);
+            set({ [key]: v } as Partial<Settings>);
+          },
+        }), out));
+    };
+    const pct = (v: number): string => `${Math.round(v * 100)}%`;
+    const check = (key: keyof Settings, label: string, hint = ''): HTMLElement =>
+      opt(label, hint, h('input', { type: 'checkbox', checked: this.settings[key] ? '' : null, 'aria-label': label, onchange: (e: Event) => set({ [key]: (e.target as HTMLInputElement).checked } as Partial<Settings>) }));
+    const choice = <K extends keyof Settings>(key: K, label: string, hint: string, opts: [Settings[K], string][]): HTMLElement =>
+      opt(label, hint, h('select', {
+        'aria-label': label, onchange: (e: Event) => {
+          const raw = (e.target as HTMLSelectElement).value;
+          const v = opts.find(([o]) => String(o) === raw)?.[0];
+          set({ [key]: v } as Partial<Settings>);
         },
-      }), ` ${label}`);
-    const quality = h('select', {
-      onchange: (e: Event) => {
-        s.quality = (e.target as HTMLSelectElement).value as Settings['quality'];
-        this.settings = { ...s };
-        this.applySettings();
-      },
-    }, ...(['low', 'medium', 'high', 'ultra'] as const).map((q) => h('option', { value: q, selected: s.quality === q ? '' : null }, q[0].toUpperCase() + q.slice(1))));
+      }, ...opts.map(([v, l]) => h('option', { value: String(v), selected: this.settings[key] === v ? '' : null }, l))));
+
+    const kbdRow = (keys: string[], text: string): HTMLElement => h('tr', null, h('td', null, ...keys.flatMap((k, i) => [i ? ' ' : '', h('kbd', null, k)])), h('td', null, text));
+    const TABS: [string, string, string, () => HTMLElement[]][] = [
+      ['graphics', 'Graphics', 'monitor', () => [
+        h('h4', null, 'Rendering'),
+        choice('quality', 'Quality', 'Lower it if the frame rate drops', [['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['ultra', 'Ultra']]),
+        h('h4', null, '3D labels'),
+        check('labels3d', 'Aircraft labels in the 3D view'),
+        range('labelDistance', 'Label distance', 'Hide labels beyond this distance', 5000, 40000, 1000, (v) => `${Math.round(v / 1000)} km`),
+      ]],
+      ['interface', 'Interface', 'sliders', () => [
+        h('h4', null, 'Appearance'),
+        choice('uiScale', 'Interface scale', 'Size of all text and panels. Auto adapts to the window size', [[0, 'Auto'], [0.85, '85%'], [0.9, '90%'], [1, '100%'], [1.1, '110%'], [1.2, '120%'], [1.3, '130%'], [1.4, '140%'], [1.5, '150%']]),
+        choice('theme', 'Theme', '', [['console', 'Console (dark)'], ['contrast', 'High contrast']]),
+        choice('density', 'Flight strip density', '', [['comfortable', 'Comfortable'], ['compact', 'Compact']]),
+        check('reducedMotion', 'Reduce motion', 'Disables pulsing, flashes and animated transitions'),
+        check('kbdHints', 'Show keyboard hints on buttons'),
+        h('h4', null, 'Units & time'),
+        choice('units', 'Altitude units', 'Strips and command panel (the radar keeps hundreds of feet)', [['ft', 'Feet'], ['m', 'Metres']]),
+        choice('clock24', 'Clock', '', [[true, '24-hour'], [false, '12-hour']]),
+        h('h4', null, 'Layout'),
+        opt('Reset panel layout', 'Column widths, comms height and collapsed panels', h('button', {
+          class: 'btn sm', onclick: (e: Event) => {
+            e.preventDefault();
+            set({ stripsW: DEFAULT_SETTINGS.stripsW, rightW: DEFAULT_SETTINGS.rightW, commsH: DEFAULT_SETTINGS.commsH, commsCollapsed: false, stripsCollapsed: false });
+            this.toast('Layout reset');
+          },
+        }, 'Reset')),
+      ]],
+      ['radar', 'Radar', 'radar', () => [
+        h('h4', null, 'Scope'),
+        choice('radarRange', 'Default range', 'Used when a session starts', [[0, 'Fit airspace'], [10, '10 NM'], [20, '20 NM'], [30, '30 NM'], [40, '40 NM']]),
+        check('radarRings', 'Range rings'),
+        check('radarFixes', 'Fixes'),
+        check('radarIls', 'Extended centrelines'),
+        check('radarWater', 'Coastline'),
+        h('h4', null, 'Targets'),
+        check('radarBlocks', 'Full data blocks', 'Adds type and clearance as a third line'),
+        range('radarTrail', 'History trail', 'Dots behind each target', 0, 12, 1, (v) => (v ? String(v) : 'off')),
+        choice('radarVector', 'Predicted vector', '', [[0, 'Off'], [60, '1 minute'], [120, '2 minutes']]),
+        range('radarFont', 'Data block size', '', 9, 15, 1, (v) => `${v}px`),
+      ]],
+      ['audio', 'Audio', 'volume', () => [
+        h('h4', null, 'Volume'),
+        range('master', 'Master', '', 0, 1, 0.05, pct), range('engines', 'Engines', '', 0, 1, 0.05, pct), range('radio', 'Radio', '', 0, 1, 0.05, pct),
+        range('ambience', 'Ambience & weather', '', 0, 1, 0.05, pct), range('music', 'Music', '', 0, 1, 0.05, pct), range('ui', 'Interface sounds', '', 0, 1, 0.05, pct),
+        h('h4', null, 'Radio voices'),
+        check('pilotVoices', 'Speak pilot transmissions'),
+        check('controllerVoice', 'Speak my (controller) transmissions'),
+      ]],
+      ['gameplay', 'Gameplay', 'gamepad', () => [
+        h('h4', null, 'Session'),
+        range('autosaveSec', 'Autosave interval', 'How often the checkpoint is saved while playing', 10, 120, 5, (v) => `${v} s`),
+        check('pauseOnBlur', 'Pause when the tab is hidden'),
+      ]],
+      ['controls', 'Controls', 'keyboard', () => [
+        h('h4', null, 'General'),
+        h('table', { class: 'keys' },
+          kbdRow(['Space'], 'Pause / resume'), kbdRow(['Tab'], 'Swap radar and 3D view'), kbdRow(['1', '2', '3', '4'], 'Tower / orbit / follow / cockpit camera'),
+          kbdRow(['+', '−'], 'Simulation speed'), kbdRow(['↑', '↓'], 'Select previous / next flight strip'), kbdRow(['N'], 'Notifications'),
+          kbdRow(['Esc'], 'Close picker · deselect · pause menu'), kbdRow(['F1'], 'Help')),
+        h('h4', null, 'Selected aircraft'),
+        h('table', { class: 'keys' },
+          kbdRow(['R'], 'Respond to the pilot’s request'), kbdRow(['H'], 'Heading (←/→ adjust, Enter sends)'), kbdRow(['A'], 'Altitude'), kbdRow(['S'], 'Speed'),
+          kbdRow(['D'], 'Direct to'), kbdRow(['O'], 'Hold at'), kbdRow(['I'], 'Cleared ILS'), kbdRow(['L'], 'Cleared to land'), kbdRow(['G'], 'Go around'),
+          kbdRow(['C'], 'Contact departure'), kbdRow(['P'], 'Push back'), kbdRow(['T'], 'Taxi'), kbdRow(['X'], 'Cross runway'), kbdRow(['Z'], 'Hold position'),
+          kbdRow(['V'], 'Continue taxi'), kbdRow(['U'], 'Line up & wait'), kbdRow(['K'], 'Cleared for take-off'), kbdRow(['Q'], 'Cancel take-off')),
+        h('h4', null, 'Radar'),
+        h('table', { class: 'keys' },
+          kbdRow(['Wheel'], 'Zoom'), kbdRow(['Drag'], 'Pan · drag a data block to move it'), kbdRow(['Shift', 'Drag'], 'Measure bearing & distance'),
+          kbdRow(['R-click'], 'Vector the selected aircraft'), kbdRow(['Dbl-click'], 'Re-centre · reset a moved data block')),
+      ]],
+    ];
+    const pane = h('div', { class: 'settings-pane' });
+    const nav = h('nav', { class: 'settings-nav', role: 'tablist' });
+    const showTab = (id: string): void => {
+      const t = TABS.find((x) => x[0] === id) ?? TABS[0];
+      pane.replaceChildren(...t[3]());
+      for (const b of nav.children) b.classList.toggle('active', (b as HTMLElement).dataset.id === t[0]);
+    };
+    for (const [id, label, ic] of TABS) nav.append(h('button', { 'data-id': id, role: 'tab', onclick: () => showTab(id) }, icon(ic), label));
+    showTab('graphics');
     this.modal('Settings', [
-      h('div', { class: 'settings-grid' },
-        h('div', null,
-          h('h4', null, 'Graphics'),
-          h('label', { class: 'field' }, h('span', null, 'Quality'), quality),
-          check('labels3d', 'Aircraft labels in the 3D view'),
-          h('h4', null, 'Radio'),
-          check('pilotVoices', 'Speak pilot transmissions'),
-          check('controllerVoice', 'Speak my (controller) transmissions'),
-        ),
-        h('div', null,
-          h('h4', null, 'Volume'),
-          slider('master', 'Master'), slider('engines', 'Engines'), slider('radio', 'Radio'), slider('ambience', 'Ambience & weather'), slider('music', 'Music'), slider('ui', 'Interface'),
-        ),
+      h('div', { class: 'settings' }, nav, pane),
+      h('div', { class: 'settings-foot' },
+        h('button', {
+          class: 'btn ghost sm', onclick: async () => {
+            if (await this.confirm('Reset settings', 'Restore every setting to its default value?', 'Reset')) {
+              set({ ...DEFAULT_SETTINGS });
+              const active = (nav.querySelector('.active') as HTMLElement | null)?.dataset.id ?? 'graphics';
+              showTab(active);
+            }
+          },
+        }, 'Restore defaults'),
+        h('button', { class: 'btn primary', onclick: () => this.closeTopModal() }, 'Done'),
       ),
-      h('div', { class: 'row end' }, h('button', { class: 'btn primary', onclick: () => this.closeTopModal() }, 'Done')),
     ], {
       wide: true,
-      onClose: () => {
-        if (this.profile) {
-          this.profile.settings = this.settings;
-          void api.saveSettings(this.profile.id, this.settings).catch(() => this.toast('Could not save settings', true));
-        }
-      },
+      icon: 'gear',
+      onClose: () => this.persistSettings(),
     });
   }
 }
