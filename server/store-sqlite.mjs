@@ -11,9 +11,24 @@ export function createSqliteStore(dataDir) {
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 3000;
+  `);
+  // v1: profiles belong to a Google account. Pre-auth profiles had no owner and are dropped with their data.
+  if (db.prepare('PRAGMA user_version').get().user_version < 1) {
+    db.exec(`
+      BEGIN IMMEDIATE;
+      DROP TABLE IF EXISTS results;
+      DROP TABLE IF EXISTS saves;
+      DROP TABLE IF EXISTS profiles;
+      COMMIT;
+      PRAGMA user_version = 1;
+    `);
+  }
+  db.exec(`
     CREATE TABLE IF NOT EXISTS profiles (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      google_sub TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL DEFAULT '',
+      name TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       last_played_at INTEGER NOT NULL,
       settings TEXT NOT NULL DEFAULT '{}',
@@ -45,14 +60,11 @@ export function createSqliteStore(dataDir) {
   `);
 
   const q = {
-    listProfiles: db.prepare(`
-      SELECT p.id, p.name, p.created_at, p.last_played_at, p.career,
-        (SELECT s.summary FROM saves s WHERE s.profile_id = p.id AND s.kind = 'auto') AS checkpoint
-      FROM profiles p ORDER BY p.last_played_at DESC`),
-    countProfiles: db.prepare('SELECT COUNT(*) AS n FROM profiles'),
     getProfile: db.prepare('SELECT * FROM profiles WHERE id = ?'),
-    findProfileByName: db.prepare('SELECT id FROM profiles WHERE name = ?'),
-    insertProfile: db.prepare('INSERT INTO profiles (name, created_at, last_played_at) VALUES (?, ?, ?)'),
+    getProfileBySub: db.prepare('SELECT * FROM profiles WHERE google_sub = ?'),
+    insertProfile: db.prepare('INSERT INTO profiles (google_sub, email, name, created_at, last_played_at) VALUES (?, ?, ?, ?, ?)'),
+    setEmail: db.prepare('UPDATE profiles SET email = ? WHERE id = ?'),
+    checkpointSummary: db.prepare("SELECT summary FROM saves WHERE profile_id = ? AND kind = 'auto'"),
     deleteProfile: db.prepare('DELETE FROM profiles WHERE id = ?'),
     touchProfile: db.prepare('UPDATE profiles SET last_played_at = ? WHERE id = ?'),
     setSettings: db.prepare('UPDATE profiles SET settings = ? WHERE id = ?'),
@@ -71,11 +83,18 @@ export function createSqliteStore(dataDir) {
   };
 
   return {
-    countProfiles: async () => q.countProfiles.get().n,
-    listProfiles: async () => q.listProfiles.all(),
     getProfile: async (id) => q.getProfile.get(id),
-    findProfileByName: async (name) => q.findProfileByName.get(name),
-    insertProfile: async (name, now) => Number(q.insertProfile.run(name, now, now).lastInsertRowid),
+    /** Finds the profile of a Google account, creating it on first sign-in. */
+    async upsertUserProfile({ sub, email, name, now }) {
+      const row = q.getProfileBySub.get(sub);
+      if (row) {
+        if (email && row.email !== email) q.setEmail.run(email, row.id);
+        return q.getProfile.get(row.id);
+      }
+      const id = Number(q.insertProfile.run(sub, email, name, now, now).lastInsertRowid);
+      return q.getProfile.get(id);
+    },
+    getCheckpointSummary: async (id) => q.checkpointSummary.get(id)?.summary ?? null,
     deleteProfile: async (id) => void q.deleteProfile.run(id),
     setSettings: async (id, text) => void q.setSettings.run(text, id),
     setCareer: async (id, text, now) => void q.setCareer.run(text, now, id),

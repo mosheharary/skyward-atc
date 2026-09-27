@@ -43,10 +43,15 @@ await page.goto(base, { waitUntil: 'load', timeout: 60000 });
 await sleep(2500);
 
 if (scenario === 'new') {
-  await shot('profiles');
-  await page.type('input[type=text]', process.env.NAME || 'Tester');
-  await clickText('button', 'Create profile');
-  await sleep(1500);
+  await shot('sign-in');
+  // Needs a server started with AUTH_TEST_LOGIN=1 (never available on Vercel); stands in for the Google round-trip.
+  const who = process.env.NAME || 'Tester';
+  const ok = await page.evaluate(async (name) => (await fetch('/api/auth/test-login', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sub: name.toLowerCase(), name }),
+  })).ok, who);
+  if (!ok) throw new Error('test-login failed: start the server with AUTH_TEST_LOGIN=1');
+  await page.reload({ waitUntil: 'load' });
+  await sleep(2500);
   await shot('main-menu');
   await page.click('#btn-career');
   await sleep(800);

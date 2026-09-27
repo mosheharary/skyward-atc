@@ -9,6 +9,11 @@ services:
     volumes:
       # Profiles, checkpoints, saves and results live here and survive restarts/rebuilds.
       - ./skyward-data:/data
+    env_file:
+      # GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, SESSION_SECRET (see .env.example).
+      - path: .env
+        required: false
     environment:
       LOG_REQUESTS: "0"
+      PUBLIC_URL: http://localhost:8080
     restart: unless-stopped

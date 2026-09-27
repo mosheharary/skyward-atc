@@ -7,6 +7,7 @@ dist/
 .env.*
 .vercel
 .env*
+!.env.example
 
 # Docker Compose data volume (profiles, saves)
 skyward-data/

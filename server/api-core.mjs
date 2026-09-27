@@ -1,5 +1,10 @@
 // Skyward ATC JSON API: routes, validation and HTTP plumbing shared by the Node server (SQLite)
 // and the Vercel function (Postgres). Storage is injected as an async `store` object.
+// All player data is scoped to the Google-signed-in user's own profile (see server/auth.mjs).
+
+import {
+  authConfig, baseUrl, clearOauthCookie, clearSessionCookie, finishLogin, googleConfigured, profileName, sessionCookie, sessionFrom, startLogin,
+} from './auth.mjs';
 
 const MAX_BODY = 4 * 1024 * 1024;
 const MAX_MANUAL_SAVES = 10;
@@ -18,26 +23,6 @@ export const parseJson = (text, fallback) => {
     return fallback;
   }
 };
-
-function profileSummary(row) {
-  const career = parseJson(row.career, {});
-  return {
-    id: row.id,
-    name: row.name,
-    createdAt: row.created_at,
-    lastPlayedAt: row.last_played_at,
-    careerSummary: career && typeof career === 'object' ? career.summary ?? null : null,
-    checkpoint: row.checkpoint ? parseJson(row.checkpoint, null) : null,
-  };
-}
-
-function validName(raw) {
-  if (typeof raw !== 'string') return null;
-  const name = raw.trim().replace(/\s+/g, ' ');
-  if (name.length < 1 || name.length > 24) return null;
-  if (!/^[\p{L}\p{N} _.'-]+$/u.test(name)) return null;
-  return name;
-}
 
 function requireObject(value, what) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new HttpError(400, `${what} must be a JSON object`);
@@ -104,13 +89,14 @@ export const SECURITY_HEADERS = {
     "object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
 };
 
-function sendJson(res, status, body) {
+function sendJson(res, status, body, cookies = []) {
   const data = body === undefined ? '' : JSON.stringify(body);
   res.writeHead(status, {
     ...SECURITY_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(data),
+    ...(cookies.length ? { 'Set-Cookie': cookies } : {}),
   });
   res.end(data);
 }
@@ -120,7 +106,8 @@ const intParam = (v) => {
   return Number(v);
 };
 
-export function createApi(store, { version = '1.0.0' } = {}) {
+export function createApi(store, { version = '1.0.0', env = process.env, fetchImpl } = {}) {
+  const cfg = authConfig(env);
   const routes = [];
   const route = (method, pattern, handler) => {
     const keys = [];
@@ -130,54 +117,92 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     routes.push({ method, re, keys, handler });
   };
 
-  async function requireProfile(id) {
-    const row = await store.getProfile(id);
-    if (!row) throw new HttpError(404, 'Profile not found');
+  /** The signed-in user's profile row. Every data route goes through this, so a user can only reach their own rows. */
+  async function requireSession(req) {
+    const s = sessionFrom(req, cfg);
+    const row = s ? await store.getProfile(s.pid) : null;
+    if (!row || row.google_sub !== s.sub) throw new HttpError(401, 'Not signed in');
     return row;
   }
 
+  const secureFor = (req) => baseUrl(req, cfg).startsWith('https:');
+
   route('GET', '/api/health', async () => ({
     status: 200,
-    body: { ok: true, version, uptime: Math.round(process.uptime()), profiles: await store.countProfiles() },
+    body: { ok: true, version, uptime: Math.round(process.uptime()), auth: googleConfigured(cfg) },
   }));
 
-  route('GET', '/api/profiles', async () => ({ status: 200, body: (await store.listProfiles()).map(profileSummary) }));
+  // ---- Authentication -------------------------------------------------------------------------
 
-  route('POST', '/api/profiles', async ({ req }) => {
-    const body = requireObject(await readBody(req), 'Body');
-    const name = validName(body.name);
-    if (!name) throw new HttpError(400, 'Name must be 1-24 letters, digits, spaces or . _ \' -');
-    if (await store.findProfileByName(name)) throw new HttpError(409, 'A profile with that name already exists');
-    const now = Date.now();
-    const id = await store.insertProfile(name, now);
-    return { status: 201, body: { id, name, createdAt: now, lastPlayedAt: now, settings: {}, career: {} } };
+  route('GET', '/api/auth/login', async ({ req }) => {
+    if (!googleConfigured(cfg)) throw new HttpError(503, 'Google sign-in is not configured on this server');
+    const { url, cookie } = startLogin(cfg, baseUrl(req, cfg));
+    return { status: 302, redirect: url, cookies: [cookie] };
   });
 
-  route('GET', '/api/profiles/:id', async ({ params }) => {
-    const row = await requireProfile(intParam(params.id));
+  route('GET', '/api/auth/callback', async ({ req }) => {
+    const base = baseUrl(req, cfg);
+    const secure = base.startsWith('https:');
+    try {
+      if (!googleConfigured(cfg)) throw new Error('Google sign-in is not configured');
+      const who = await finishLogin(req, cfg, base, fetchImpl);
+      const profile = await store.upsertUserProfile({
+        sub: who.sub,
+        email: who.email,
+        name: profileName(who.name || who.email.split('@')[0]),
+        now: Date.now(),
+      });
+      return { status: 302, redirect: '/', cookies: [sessionCookie(profile, cfg, secure), clearOauthCookie(secure)] };
+    } catch (e) {
+      console.warn('Google sign-in failed:', e instanceof Error ? e.message : e);
+      return { status: 302, redirect: '/?auth_error=1', cookies: [clearOauthCookie(secure)] };
+    }
+  });
+
+  route('POST', '/api/auth/logout', async ({ req }) => ({ status: 204, cookies: [clearSessionCookie(secureFor(req))] }));
+
+  if (cfg.testLogin) {
+    route('POST', '/api/auth/test-login', async ({ req }) => {
+      const b = requireObject(await readBody(req), 'Body');
+      if (typeof b.sub !== 'string' || !b.sub) throw new HttpError(400, 'sub is required');
+      const profile = await store.upsertUserProfile({
+        sub: `test:${b.sub}`,
+        email: typeof b.email === 'string' ? b.email : '',
+        name: profileName(b.name || b.sub),
+        now: Date.now(),
+      });
+      return { status: 200, body: { ok: true, id: profile.id }, cookies: [sessionCookie(profile, cfg, secureFor(req))] };
+    });
+  }
+
+  // ---- The signed-in user's data ----------------------------------------------------------------
+
+  route('GET', '/api/me', async ({ req }) => {
+    const row = await requireSession(req);
+    const cp = await store.getCheckpointSummary(row.id);
     return {
       status: 200,
       body: {
         id: row.id,
         name: row.name,
+        email: row.email ?? '',
         createdAt: row.created_at,
         lastPlayedAt: row.last_played_at,
         settings: parseJson(row.settings, {}),
         career: parseJson(row.career, {}),
+        checkpoint: cp ? parseJson(cp, null) : null,
       },
     };
   });
 
-  route('DELETE', '/api/profiles/:id', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
-    await store.deleteProfile(id);
-    return { status: 204 };
+  route('DELETE', '/api/me', async ({ req }) => {
+    const row = await requireSession(req);
+    await store.deleteProfile(row.id);
+    return { status: 204, cookies: [clearSessionCookie(secureFor(req))] };
   });
 
-  route('PUT', '/api/profiles/:id/settings', async ({ req, params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('PUT', '/api/me/settings', async ({ req }) => {
+    const { id } = await requireSession(req);
     const settings = requireObject(await readBody(req), 'Settings');
     const text = JSON.stringify(settings);
     if (text.length > 64 * 1024) throw new HttpError(413, 'Settings too large');
@@ -185,9 +210,8 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     return { status: 200, body: { ok: true } };
   });
 
-  route('PUT', '/api/profiles/:id/career', async ({ req, params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('PUT', '/api/me/career', async ({ req }) => {
+    const { id } = await requireSession(req);
     const career = requireObject(await readBody(req), 'Career');
     const text = JSON.stringify(career);
     if (text.length > 256 * 1024) throw new HttpError(413, 'Career data too large');
@@ -195,9 +219,8 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     return { status: 200, body: { ok: true } };
   });
 
-  async function saveCheckpoint({ req, params }) {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  async function saveCheckpoint({ req }) {
+    const { id } = await requireSession(req);
     const body = requireObject(await readBody(req), 'Body');
     const state = requireObject(body.state, 'state');
     const summary = body.summary && typeof body.summary === 'object' ? body.summary : {};
@@ -205,13 +228,12 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     await store.upsertCheckpoint(id, JSON.stringify(summary), JSON.stringify(state), now);
     return { status: 200, body: { ok: true, updatedAt: now } };
   }
-  route('PUT', '/api/profiles/:id/checkpoint', saveCheckpoint);
+  route('PUT', '/api/me/checkpoint', saveCheckpoint);
   // sendBeacon() can only POST; accept it too.
-  route('POST', '/api/profiles/:id/checkpoint', saveCheckpoint);
+  route('POST', '/api/me/checkpoint', saveCheckpoint);
 
-  route('GET', '/api/profiles/:id/checkpoint', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('GET', '/api/me/checkpoint', async ({ req }) => {
+    const { id } = await requireSession(req);
     const row = await store.getCheckpoint(id);
     if (!row) throw new HttpError(404, 'No checkpoint');
     return {
@@ -220,16 +242,14 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     };
   });
 
-  route('DELETE', '/api/profiles/:id/checkpoint', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('DELETE', '/api/me/checkpoint', async ({ req }) => {
+    const { id } = await requireSession(req);
     await store.deleteCheckpoint(id);
     return { status: 204 };
   });
 
-  route('GET', '/api/profiles/:id/saves', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('GET', '/api/me/saves', async ({ req }) => {
+    const { id } = await requireSession(req);
     return {
       status: 200,
       body: (await store.listSaves(id)).map((r) => ({
@@ -242,9 +262,8 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     };
   });
 
-  route('POST', '/api/profiles/:id/saves', async ({ req, params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('POST', '/api/me/saves', async ({ req }) => {
+    const { id } = await requireSession(req);
     const body = requireObject(await readBody(req), 'Body');
     const state = requireObject(body.state, 'state');
     const label = typeof body.label === 'string' ? body.label.trim().slice(0, 60) : '';
@@ -255,9 +274,8 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     return { status: 201, body: { id: saveId, label: label || 'Saved game', summary, createdAt: now, updatedAt: now } };
   });
 
-  route('GET', '/api/profiles/:id/saves/:saveId', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('GET', '/api/me/saves/:saveId', async ({ req, params }) => {
+    const { id } = await requireSession(req);
     const row = await store.getSave(intParam(params.saveId), id);
     if (!row) throw new HttpError(404, 'Save not found');
     return {
@@ -266,17 +284,15 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     };
   });
 
-  route('DELETE', '/api/profiles/:id/saves/:saveId', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('DELETE', '/api/me/saves/:saveId', async ({ req, params }) => {
+    const { id } = await requireSession(req);
     const deleted = await store.deleteSave(intParam(params.saveId), id);
     if (!deleted) throw new HttpError(404, 'Save not found');
     return { status: 204 };
   });
 
-  route('POST', '/api/profiles/:id/results', async ({ req, params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('POST', '/api/me/results', async ({ req }) => {
+    const { id } = await requireSession(req);
     const b = requireObject(await readBody(req), 'Body');
     if (typeof b.shiftId !== 'string' || typeof b.airport !== 'string') throw new HttpError(400, 'shiftId and airport are required');
     const score = Math.round(Number(b.score) || 0);
@@ -286,9 +302,8 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     return { status: 201, body: { id: resultId, completedAt: now } };
   });
 
-  route('GET', '/api/profiles/:id/results', async ({ params }) => {
-    const id = intParam(params.id);
-    await requireProfile(id);
+  route('GET', '/api/me/results', async ({ req }) => {
+    const { id } = await requireSession(req);
     return {
       status: 200,
       body: (await store.listResults(id)).map((r) => ({
@@ -303,6 +318,13 @@ export function createApi(store, { version = '1.0.0' } = {}) {
     };
   });
 
+  /** Cross-site writes are refused (on top of SameSite=Lax cookies). */
+  function checkOrigin(req) {
+    if (req.method === 'GET' || req.method === 'HEAD') return;
+    const origin = req.headers.origin;
+    if (origin && origin !== new URL(baseUrl(req, cfg)).origin) throw new HttpError(403, 'Cross-origin request refused');
+  }
+
   return async function handleApi(req, res, pathname) {
     const started = Date.now();
     let status = 500;
@@ -311,14 +333,19 @@ export function createApi(store, { version = '1.0.0' } = {}) {
       if (candidates.length === 0) throw new HttpError(404, 'Not found');
       const r = candidates.find((c) => c.method === req.method);
       if (!r) throw new HttpError(405, 'Method not allowed');
+      checkOrigin(req);
       const m = r.re.exec(pathname);
       const params = Object.fromEntries(r.keys.map((k, i) => [k, decodeURIComponent(m[i + 1])]));
       const out = await r.handler({ req, res, params });
       status = out.status;
-      if (status === 204) {
-        res.writeHead(204, { ...SECURITY_HEADERS, 'Cache-Control': 'no-store' });
+      const cookies = out.cookies ?? [];
+      if (out.redirect) {
+        res.writeHead(status, { ...SECURITY_HEADERS, 'Cache-Control': 'no-store', Location: out.redirect, 'Set-Cookie': cookies });
         res.end();
-      } else sendJson(res, status, out.body);
+      } else if (status === 204) {
+        res.writeHead(204, { ...SECURITY_HEADERS, 'Cache-Control': 'no-store', ...(cookies.length ? { 'Set-Cookie': cookies } : {}) });
+        res.end();
+      } else sendJson(res, status, out.body, cookies);
     } catch (e) {
       status = e instanceof HttpError ? e.status : 500;
       if (status === 500) console.error('API error', req.method, pathname, e);
