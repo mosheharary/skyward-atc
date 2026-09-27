@@ -1,0 +1,145 @@
+/* Design tokens. Every colour, size and radius used by the interface lives here.
+   Sizes are in rem so the "Interface scale" setting (--ui-scale) scales the whole HUD. */
+:root {
+  --ui-scale: 1;
+
+  /* ---- surfaces */
+  --bg: #050b10;
+  --bg-2: #07131a;
+  --surface-0: #081219;
+  --surface-1: #0b1821;
+  --surface-2: #0f222b;
+  --surface-3: #15303b;
+  --surface-4: #1b3d49;
+  --glass: rgba(9, 20, 28, 0.88);
+  --glass-2: rgba(5, 14, 20, 0.92);
+  --scrim: rgba(0, 5, 10, 0.6);
+
+  /* ---- lines */
+  --line: rgba(120, 190, 200, 0.16);
+  --line-2: rgba(120, 200, 210, 0.28);
+  --line-strong: rgba(140, 225, 230, 0.5);
+
+  /* ---- text */
+  --text: #dbe9ec;
+  --text-2: #b2c6ca;
+  --dim: #7d959b;
+  --faint: #56696e;
+
+  /* ---- brand */
+  --accent: #39d0c4;
+  --accent-2: #7ff5e6;
+  --accent-bg: rgba(57, 208, 196, 0.14);
+  --accent-grad: linear-gradient(180deg, #1fa99f, #127a72);
+  --accent-grad-hover: linear-gradient(180deg, #27c1b6, #168c83);
+
+  /* ---- signal colours */
+  --amber: #ffc24a;
+  --red: #ff5a5a;
+  --green: #7fe0a0;
+  --blue: #6fb8ff;
+  --orange: #f0a860;
+  --magenta: #ff6adf;
+
+  /* ---- semantic */
+  --c-arr: var(--blue);
+  --c-dep: var(--green);
+  --c-req: var(--amber);
+  --c-conflict: #ffb030;
+  --c-loss: var(--red);
+  --c-emerg: var(--magenta);
+  --c-good: var(--green);
+  --c-bad: var(--red);
+  --c-warn: var(--amber);
+  --c-info: var(--accent);
+  --c-req-bg: rgba(255, 194, 74, 0.12);
+  --c-bad-bg: rgba(255, 70, 70, 0.14);
+  --c-good-bg: rgba(127, 224, 160, 0.12);
+
+  /* ---- type */
+  --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+  --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --fs-2xs: 0.625rem;
+  --fs-xs: 0.6875rem;
+  --fs-sm: 0.75rem;
+  --fs-md: 0.8125rem;
+  --fs-base: 0.875rem;
+  --fs-lg: 1rem;
+  --fs-xl: 1.25rem;
+  --fs-2xl: 1.625rem;
+  --fs-3xl: 2.125rem;
+  --tracking-caps: 0.12em;
+
+  /* ---- spacing */
+  --sp-1: 0.25rem;
+  --sp-2: 0.5rem;
+  --sp-3: 0.75rem;
+  --sp-4: 1rem;
+  --sp-5: 1.25rem;
+  --sp-6: 1.5rem;
+  --sp-8: 2rem;
+
+  /* ---- radii */
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-2xl: 18px;
+  --r-pill: 999px;
+
+  /* ---- elevation */
+  --sh-1: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --sh-2: 0 10px 28px rgba(0, 0, 0, 0.45);
+  --sh-3: 0 30px 80px rgba(0, 0, 0, 0.6);
+  --glow-accent: 0 0 0 1px rgba(57, 208, 196, 0.55), 0 0 18px rgba(57, 208, 196, 0.25);
+  --glow-amber: 0 0 0 1px rgba(255, 194, 74, 0.7), 0 0 16px rgba(255, 194, 74, 0.3);
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px rgba(57, 208, 196, 0.85);
+
+  /* ---- motion */
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --t-fast: 0.12s;
+  --t-med: 0.22s;
+  --t-slow: 0.45s;
+
+  /* ---- layout (px, resized from the HUD) */
+  --topbar-h: 3.25rem;
+  --strips-w: 272px;
+  --right-w: 384px;
+  --comms-h: 156px;
+  --mini-h: 300px;
+
+  color-scheme: dark;
+}
+
+/* High-contrast theme: brighter lines and text, solid surfaces, no translucency. */
+:root[data-theme='contrast'] {
+  --bg: #000;
+  --bg-2: #02080b;
+  --surface-0: #000;
+  --surface-1: #03090c;
+  --surface-2: #0a1a20;
+  --surface-3: #12303a;
+  --surface-4: #1a4150;
+  --glass: #03090c;
+  --glass-2: #000;
+  --line: rgba(160, 230, 235, 0.38);
+  --line-2: rgba(170, 240, 245, 0.6);
+  --line-strong: #bff;
+  --text: #fff;
+  --text-2: #e6f4f6;
+  --dim: #b4c8cc;
+  --faint: #8aa0a5;
+  --accent: #4ff0e2;
+  --accent-2: #a6fff3;
+  --amber: #ffd060;
+  --red: #ff6b6b;
+  --green: #8ff5b0;
+  --blue: #8cc8ff;
+}
+
+/* Reduced motion, either from the OS or from the Interface settings. */
+:root[data-motion='reduced'] {
+  --t-fast: 0s;
+  --t-med: 0s;
+  --t-slow: 0s;
+}

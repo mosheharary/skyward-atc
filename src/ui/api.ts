@@ -35,6 +35,38 @@ export interface Settings {
   controllerVoice: boolean;
   labels3d: boolean;
   autosaveSec: number;
+  // ---- interface
+  /** Root font scale for the whole HUD (0.8–1.5); 0 = automatic from the window size. */
+  uiScale: number;
+  theme: 'console' | 'contrast';
+  density: 'comfortable' | 'compact';
+  reducedMotion: boolean;
+  clock24: boolean;
+  /** Display units for altitudes in strips and the command panel (the radar always shows hundreds of feet). */
+  units: 'ft' | 'm';
+  kbdHints: boolean;
+  pauseOnBlur: boolean;
+  /** 3D label cut-off distance in metres. */
+  labelDistance: number;
+  // ---- radar
+  /** Default range in NM when a session starts; 0 = fit the airspace. */
+  radarRange: number;
+  radarRings: boolean;
+  radarFixes: boolean;
+  radarWater: boolean;
+  radarIls: boolean;
+  radarBlocks: boolean;
+  /** History dots per target (0–12). */
+  radarTrail: number;
+  /** Predicted track vector length in seconds (0, 60, 120). */
+  radarVector: number;
+  radarFont: number;
+  // ---- layout (px)
+  stripsW: number;
+  rightW: number;
+  commsH: number;
+  commsCollapsed: boolean;
+  stripsCollapsed: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -49,6 +81,29 @@ export const DEFAULT_SETTINGS: Settings = {
   controllerVoice: true,
   labels3d: true,
   autosaveSec: 20,
+  uiScale: 0,
+  theme: 'console',
+  density: 'comfortable',
+  reducedMotion: false,
+  clock24: true,
+  units: 'ft',
+  kbdHints: true,
+  pauseOnBlur: false,
+  labelDistance: 25000,
+  radarRange: 0,
+  radarRings: true,
+  radarFixes: true,
+  radarWater: true,
+  radarIls: true,
+  radarBlocks: true,
+  radarTrail: 6,
+  radarVector: 60,
+  radarFont: 11,
+  stripsW: 272,
+  rightW: 384,
+  commsH: 156,
+  commsCollapsed: false,
+  stripsCollapsed: false,
 };
 
 export interface Profile {

@@ -1,0 +1,53 @@
+/* Responsive layout: the full console needs ~1600 px; below that panels condense, then turn into a drawer and a bottom sheet. */
+.drawer-scrim { display: none; }
+.mini-view { height: min(calc(var(--mini-h) * var(--ui-scale)), 40vh); }
+
+@media (max-width: 1640px) {
+  .tb-name, .tb-vis { display: none; }
+  .tb-controls .lbl-t { display: none; }
+  .tb-controls .tb-btn { padding: 0.35rem 0.5rem; }
+}
+
+@media (max-width: 1360px) {
+  :root { --right-w: 340px !important; }
+  .game { --right-w: 340px !important; }
+  .tb-cluster { padding: 0 var(--sp-2); gap: var(--sp-2); }
+  .tb-met .tb-item.tb-qnh { display: none; }
+  .tb-saved { display: none; }
+}
+
+/* Strips become a slide-over drawer. */
+@media (max-width: 1200px) {
+  .game-body, .game-body.strips-collapsed { grid-template-columns: 0 minmax(0, 1fr) calc(var(--right-w) * var(--ui-scale)); }
+  .left-col { position: absolute; left: 0; top: 0; bottom: 0; width: min(320px, 86vw); transform: translateX(-102%); transition: transform var(--t-med) var(--ease); box-shadow: var(--sh-3); z-index: 12; }
+  .left-col .col-resize { display: none; }
+  .game.drawer-open .left-col { transform: none; }
+  .game.drawer-open .drawer-scrim { display: block; position: absolute; inset: 0; background: rgba(0, 0, 0, 0.4); z-index: 11; }
+  .tb-drawer { display: inline-flex; align-self: center; margin-right: var(--sp-1); }
+  .game-body.strips-collapsed .sb-tools, .game-body.strips-collapsed .sb-bays { display: flex; }
+  .game-body.strips-collapsed .rail-count { display: none; }
+  .tb-runways { display: none; }
+}
+
+/* Command panel becomes a bottom sheet; the mini view is dropped (Tab still swaps the big view). */
+@media (max-width: 900px) {
+  .game-body, .game-body.strips-collapsed { grid-template-columns: 0 minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
+  .game-body > .center-col { grid-column: 2; grid-row: 1; }
+  .game-body > .right-col { grid-column: 1 / -1; grid-row: 2; max-height: 42vh; border-left: none; border-top: 1px solid var(--line-2); }
+  .right-col .col-resize, .mini-view { display: none; }
+  .tb-met, .tb-perf .tb-traffic { display: none; }
+  .comms { --comms-h: 110px !important; }
+  .comms-head .seg { display: none; }
+  .toasts { width: 94%; }
+}
+
+@media (max-width: 600px) {
+  .tb-time .tb-clock, .tb-group[aria-label='Camera'] { display: none; }
+  .menu { padding: var(--sp-4); }
+  .menu-grid, .career { grid-template-columns: 1fr; }
+  .settings { grid-template-columns: 1fr; }
+  .settings-nav { flex-direction: row; overflow: auto; border-right: none; border-bottom: 1px solid var(--line); padding: 0 0 var(--sp-2); }
+  .help-body { grid-template-columns: 1fr; }
+  .help-nav { flex-direction: row; overflow: auto; border-right: none; }
+  .results-grid { grid-template-columns: repeat(2, 1fr); }
+}

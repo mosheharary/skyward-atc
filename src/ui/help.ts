@@ -1,6 +1,7 @@
 // In-game help: controls, workflow, phraseology, separation rules and scoring.
 
-import { h } from './dom';
+import { h, trapFocus } from './dom';
+import { icon } from './icons';
 
 interface Section {
   id: string;
@@ -38,9 +39,23 @@ const SECTIONS: Section[] = [
 <tr><td><kbd>Tab</kbd></td><td>Swap the big view between 3D and radar</td></tr>
 <tr><td><kbd>Space</kbd></td><td>Pause / resume</td></tr>
 <tr><td><kbd>+</kbd> / <kbd>-</kbd></td><td>Simulation speed ×1, ×2, ×4</td></tr>
-<tr><td><kbd>Esc</kbd></td><td>Deselect / close dialogs / pause menu</td></tr>
+<tr><td><kbd>↑</kbd> / <kbd>↓</kbd></td><td>Select the previous / next flight strip</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>Drag</kbd> on radar</td><td>Measure bearing and distance (or use the ruler button)</td></tr>
+<tr><td><kbd>Drag</kbd> a data block</td><td>Move it out of the way. Double-click resets it</td></tr>
+<tr><td><kbd>N</kbd></td><td>Notification centre</td></tr>
+<tr><td><kbd>Esc</kbd></td><td>Close picker / deselect / close dialogs / pause menu</td></tr>
 <tr><td><kbd>F1</kbd> or <kbd>?</kbd></td><td>This help</td></tr>
-</table>`,
+</table>
+<h4>Commands for the selected aircraft</h4>
+<table class="keys">
+<tr><td><kbd>R</kbd></td><td>Respond to the pilot's request (the highlighted amber button)</td></tr>
+<tr><td><kbd>H</kbd> <kbd>A</kbd> <kbd>S</kbd></td><td>Heading, altitude and speed pickers. In the heading picker <kbd>←</kbd>/<kbd>→</kbd> adjust by 5° and <kbd>Enter</kbd> sends</td></tr>
+<tr><td><kbd>D</kbd> <kbd>O</kbd></td><td>Direct to / hold at a fix</td></tr>
+<tr><td><kbd>I</kbd> <kbd>L</kbd> <kbd>G</kbd></td><td>Cleared ILS / cleared to land / go around</td></tr>
+<tr><td><kbd>P</kbd> <kbd>T</kbd> <kbd>X</kbd> <kbd>U</kbd> <kbd>K</kbd></td><td>Push back / taxi / cross runway / line up / cleared for take-off</td></tr>
+<tr><td><kbd>Z</kbd> <kbd>V</kbd> <kbd>C</kbd></td><td>Hold position / continue taxi / contact departure</td></tr>
+</table>
+<p>The small key on each command button shows its shortcut. Turn the hints off in <i>Settings → Interface</i>.</p>`,
   },
   {
     id: 'arrivals',
@@ -128,9 +143,12 @@ const SECTIONS: Section[] = [
 <li><b>Orbit</b>: a free camera around the airport.</li>
 <li><b>Follow</b>: chase camera behind the selected aircraft.</li>
 <li><b>Cockpit</b>: the pilot's view of the selected aircraft.</li>
-<li><b>Flight strips</b> (left): every aircraft that is your responsibility, grouped by arrivals and departures. Amber strips need you.</li>
-<li><b>Radar data block</b>: callsign / altitude in hundreds of feet ↑↓ assigned altitude, ground speed in tens of knots / type, wake and clearance.</li>
-<li><b>Top bar</b>: airport, local time, remaining shift time, ATIS letter, wind, score, speed controls and menu.</li>
+<li><b>Top bar</b>: airport and ATIS letter (hover for the full broadcast), a wind rose showing where the wind comes from against the runway in use, QNH and visibility, arrival and departure runways, local time and shift progress, score (click it for a breakdown) and traffic count (↓ arrivals, ↑ departures, ● waiting for you). Then the camera, speed, notification, settings, help and menu controls.</li>
+<li><b>Flight strips</b> (left): grouped into <span class="k amber">Needs attention</span>, Arrivals, Departures and Ground bays. Each strip shows callsign, type/wake and registration, then altitude (with climb/descent trend), assigned altitude, speed and heading, then status, clearance or route, and how long a pilot has been waiting. Filter and sort at the top. Drag the column edge to resize it, or collapse it.</li>
+<li><b>Command panel</b> (right): identity card, telemetry tiles (altitude, heading, speed, vertical speed, distance and ETA to the runway or exit fix), the clearance timeline, grouped commands and the aircraft's latest transmissions.</li>
+<li><b>Comms</b> (bottom): the radio transcript with frequencies that light up as they transmit. Filter by ATC, pilots, the selected aircraft or urgent calls. Drag the top edge to resize it.</li>
+<li><b>Radar data block</b>: callsign / altitude in hundreds of feet ↑↓ assigned altitude, ground speed in tens of knots / type, wake and clearance. Use the scope toolbar for range presets and to toggle rings, fixes, centrelines, coastline, trails, predicted vectors and full data blocks. The <i>i</i> button opens a legend.</li>
+<li><b>Notifications</b>: warnings appear at the top of the view and are kept in the notification centre (bell icon).</li>
 </ul>`,
   },
   {
@@ -153,13 +171,14 @@ export class HelpDialog {
   private readonly content: HTMLElement;
   private readonly nav: HTMLElement;
   onClose: (() => void) | null = null;
+  private release: (() => void) | null = null;
 
   constructor(parent: HTMLElement) {
     this.nav = h('nav', { class: 'help-nav' });
     this.content = h('div', { class: 'help-content' });
     this.el = h('div', { class: 'modal help hidden', role: 'dialog', 'aria-label': 'Help' },
       h('div', { class: 'modal-card help-card' },
-        h('div', { class: 'modal-head' }, h('h2', null, 'Help'), h('button', { class: 'close', 'aria-label': 'Close help', onclick: () => this.close() }, '✕')),
+        h('div', { class: 'modal-head' }, h('h2', null, icon('help'), 'Help'), h('button', { class: 'close', 'aria-label': 'Close help', onclick: () => this.close() }, icon('close'))),
         h('div', { class: 'help-body' }, this.nav, this.content),
       ),
     );
@@ -186,11 +205,18 @@ export class HelpDialog {
 
   open(id?: string): void {
     if (id) this.show(id);
+    // Re-append so Help always stacks above any dialog that opened it (e.g. the pause menu).
+    this.el.parentElement?.appendChild(this.el);
+    const wasOpen = this.isOpen;
     this.el.classList.remove('hidden');
+    if (!wasOpen) this.release = trapFocus(this.el);
   }
 
   close(): void {
+    if (!this.isOpen) return;
     this.el.classList.add('hidden');
+    this.release?.();
+    this.release = null;
     this.onClose?.();
   }
 }
