@@ -10,18 +10,36 @@ launch departures from the tower cab.
 - **Airports:** Harbor Point (KHPX, fictional), Tel Aviv Ben Gurion (LLBG, approximate) and
   San Francisco (KSFO, approximate).
 - **Modes:** a 10-shift career plus free play (choose the airport, traffic, weather and time of day).
+- **Accounts:** sign in with Google. Each Google account has one controller profile, and only that account can
+  see or change its career, checkpoint, saves and results.
 - **Stateful:** the container keeps profiles, career progress, an autosaved checkpoint of the full sim state,
   manual saves and results in SQLite on a Docker volume. **Continue** in the main menu resumes where you left off.
 
 ## Run
 
 ```sh
+cp .env.example .env              # fill in the Google OAuth client and a random SESSION_SECRET
 docker compose up -d --build
 open http://localhost:8080        # Chrome / Edge / Firefox with WebGL2
 ```
 
 Data lives in the `skyward-data` volume and survives `docker compose restart`, `down`/`up` and rebuilds.
 Wiping it (`docker compose down -v`) deletes all profiles and saves.
+
+### Google sign-in
+
+Create an OAuth client ID of type *Web application* in Google Cloud Console → APIs & Services → Credentials, and
+add every origin you serve from as an **Authorized redirect URI** with the `/api/auth/callback` path, e.g.
+`http://localhost:8080/api/auth/callback` and `https://skyward-atc.vercel.app/api/auth/callback`.
+
+| Variable | Purpose |
+| --- | --- |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | The OAuth client |
+| `SESSION_SECRET` | Signs the session cookie (`openssl rand -base64 48`); changing it signs everyone out |
+| `PUBLIC_URL` | Canonical origin used for the redirect URI (defaults to the request host) |
+
+Sessions are a signed, HttpOnly `skyward_sid` cookie valid for 30 days. Open the game on the same host as
+`PUBLIC_URL` (e.g. `localhost`, not `127.0.0.1`).
 
 The port is bound to `127.0.0.1` only. Change it to `"8080:8080"` in `docker-compose.yml` to allow other
 machines on your network.
@@ -35,6 +53,10 @@ on first request.
 ```sh
 vercel link --project skyward-atc
 vercel env add DATABASE_URL production   # paste the Postgres connection string
+vercel env add GOOGLE_CLIENT_ID production
+vercel env add GOOGLE_CLIENT_SECRET production --sensitive
+vercel env add SESSION_SECRET production --sensitive
+vercel env add PUBLIC_URL production     # https://skyward-atc.vercel.app
 vercel --prod
 ```
 
@@ -57,7 +79,8 @@ npm run typecheck && npm test && npm run build
 ```
 
 `verify/` holds the puppeteer-core scripts that drive a real Chrome for end-to-end checks
-(`node verify/flow.mjs http://localhost:8080 /tmp/flow new|continue|ground`).
+(`node verify/flow.mjs http://localhost:8080 /tmp/flow new|continue|ground`). The `new` scenario signs in
+through `/api/auth/test-login`, which only exists when the server runs with `AUTH_TEST_LOGIN=1` (never on Vercel).
 
 ### Layout
 
@@ -68,5 +91,6 @@ npm run typecheck && npm test && npm run build
 | `src/audio` | WebAudio engine: engines, ambience, radio, speech |
 | `src/ui`, `src/app` | Menus, radar scope, command panel, help, game loop |
 | `server/server.mjs` | Static server + JSON API on `node:sqlite` |
+| `server/auth.mjs` | Google OAuth (code flow + PKCE) and signed session cookies |
 | `server/api-core.mjs` | API routes shared by the Node server and the Vercel function; `store-sqlite.mjs` / `store-postgres.mjs` hold storage |
 | `api/index.mjs`, `vercel.json` | Vercel function (Postgres) and routing / headers |

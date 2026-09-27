@@ -1,4 +1,4 @@
-// Application shell: pilot profiles, main menu, career / free play setup, settings, pause menu and shift results.
+// Application shell: Google sign-in, main menu, career / free play setup, settings, pause menu and shift results.
 
 import { World, type WorldSnapshot } from '../sim/world';
 import { SHIFTS, SHIFT_BY_ID, shiftSession, starsFor, NEW_CAREER, type CareerState, type SessionConfig, type WeatherPreset } from '../sim/career';
@@ -8,13 +8,14 @@ import { createAudioEngine } from '../audio';
 import type { IAudioEngine } from '../audio/contracts';
 import { Game, type GameHost } from './Game';
 import { HelpDialog } from '../ui/help';
-import { api, DEFAULT_SETTINGS, type CheckpointSummary, type Profile, type ProfileSummary, type ResultInfo, type Settings } from '../ui/api';
+import { api, AuthError, DEFAULT_SETTINGS, LOGIN_URL, type CheckpointSummary, type Profile, type ResultInfo, type Settings } from '../ui/api';
 import { h, fmtDate, fmtDuration, trapFocus, initials } from '../ui/dom';
 import { icon } from '../ui/icons';
 import { applyUiPrefs } from '../ui/prefs';
 import { breakdownView } from '../ui/notifications';
 
-const PROFILE_KEY = 'skyward.profile';
+/** Pre-auth builds remembered the chosen profile id here. */
+const LEGACY_PROFILE_KEY = 'skyward.profile';
 
 type ModalEl = HTMLElement & { onClose?: () => void; closable?: boolean; release?: () => void };
 
@@ -32,6 +33,7 @@ export class App implements GameHost {
   private readonly toastEl: HTMLElement;
   private saveSettingsT = 0;
   private version = '';
+  private authEnabled = true;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -73,31 +75,42 @@ export class App implements GameHost {
     try {
       const hl = await api.health();
       this.version = hl.version ?? '';
+      this.authEnabled = hl.auth !== false;
     } catch {
       this.show(h('div', { class: 'menu' }, h('h1', null, 'Skyward ATC'), h('p', { class: 'err' }, 'Cannot reach the game server. Is the container running?')));
       return;
     }
-    const last = Number(localStorage.getItem(PROFILE_KEY));
-    if (last) {
-      try {
-        await this.useProfile(last);
-        return;
-      } catch {
-        localStorage.removeItem(PROFILE_KEY);
-      }
+    try {
+      localStorage.removeItem(LEGACY_PROFILE_KEY);
+    } catch {
+      /* storage unavailable */
     }
-    await this.showProfiles();
+    const authFailed = new URLSearchParams(location.search).has('auth_error');
+    if (authFailed) history.replaceState(null, '', location.pathname);
+    try {
+      await this.useProfile(await api.me());
+    } catch (e) {
+      if (!(e instanceof AuthError)) this.toast((e as Error).message, true);
+      this.showSignIn(authFailed);
+    }
+  }
+
+  /** Called when an API call reports the session is gone: keep playing, but tell the user. */
+  private sessionLost(e: unknown): boolean {
+    if (!(e instanceof AuthError)) return false;
+    this.toast('Your session has expired. Sign in again to keep saving.', true);
+    return true;
   }
 
   // ------------------------------------------------------------ GameHost
   async saveCheckpoint(state: WorldSnapshot, summary: CheckpointSummary, beacon = false): Promise<boolean> {
     if (!this.profile) return false;
-    if (beacon) return api.beaconCheckpoint(this.profile.id, state, summary);
+    if (beacon) return api.beaconCheckpoint(state, summary);
     try {
-      await api.putCheckpoint(this.profile.id, state, summary);
+      await api.putCheckpoint(state, summary);
       return true;
     } catch (e) {
-      console.warn('checkpoint save failed', e);
+      if (!this.sessionLost(e)) console.warn('checkpoint save failed', e);
       return false;
     }
   }
@@ -121,7 +134,7 @@ export class App implements GameHost {
   private persistSettings(): void {
     if (!this.profile) return;
     this.profile.settings = this.settings;
-    void api.saveSettings(this.profile.id, this.settings).catch(() => this.toast('Could not save settings', true));
+    void api.saveSettings(this.settings).catch((e) => this.sessionLost(e) || this.toast('Could not save settings', true));
   }
 
   // ------------------------------------------------------------ helpers
@@ -216,55 +229,29 @@ export class App implements GameHost {
     );
   }
 
-  // ------------------------------------------------------------ profiles
-  private async showProfiles(): Promise<void> {
-    let list: ProfileSummary[] = [];
-    try {
-      list = await api.profiles();
-    } catch (e) {
-      this.toast(String(e), true);
-    }
-    const input = h('input', { type: 'text', placeholder: 'Your controller name', maxlength: '24', 'aria-label': 'New profile name' }) as HTMLInputElement;
-    const create = async (): Promise<void> => {
-      try {
-        const p = await api.createProfile(input.value);
-        await this.useProfile(p.id);
-      } catch (e) {
-        this.toast((e as Error).message, true);
-      }
-    };
-    input.addEventListener('keydown', (e) => e.key === 'Enter' && void create());
+  // ------------------------------------------------------------ sign-in
+  private showSignIn(failed = false): void {
+    this.profile = null;
+    this.audio.setMusic('menu');
     this.show(this.menuShell(
-      h('h2', null, list.length ? 'Choose your controller profile' : 'Create your controller profile'),
-      h('div', { class: 'profile-list' },
-        ...list.map((p) =>
-          h('div', { class: 'profile' },
-            h('button', { class: 'profile-main', onclick: () => void this.useProfile(p.id) },
-              h('span', { class: 'avatar sm' }, initials(p.name)),
-              h('b', null, p.name),
-              h('span', null, p.careerSummary ?? 'New controller'),
-              h('small', null, p.checkpoint ? `Checkpoint: ${p.checkpoint.title} · ${fmtDate(p.checkpoint.savedAt)}` : `Last played ${fmtDate(p.lastPlayedAt)}`),
-            ),
-            h('button', {
-              class: 'icon danger', title: `Delete ${p.name}`, 'aria-label': `Delete ${p.name}`,
-              onclick: async () => {
-                if (await this.confirm('Delete profile', `Delete "${p.name}" with its career, checkpoint and saves? This cannot be undone.`, 'Delete', true)) {
-                  await api.deleteProfile(p.id);
-                  void this.showProfiles();
-                }
-              },
-            }, icon('trash')),
-          ),
-        ),
+      h('div', { class: 'signin card' },
+        h('h2', null, 'Sign in to start your shift'),
+        h('p', { class: 'dim' }, 'Your career, checkpoint and saved games are stored with your Google account. Only you can see them.'),
+        this.authEnabled
+          ? h('a', { class: 'btn google', id: 'btn-google', href: LOGIN_URL }, icon('google'), 'Sign in with Google')
+          : h('p', { class: 'err' }, 'Sign-in is not configured on this server (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / SESSION_SECRET).'),
+        failed ? h('p', { class: 'err', role: 'alert' }, 'Google sign-in did not complete. Please try again.') : null,
       ),
-      h('div', { class: 'row' }, input, h('button', { class: 'btn primary', onclick: () => void create() }, icon('user'), 'Create profile')),
     ));
-    setTimeout(() => input.focus(), 0);
   }
 
-  private async useProfile(id: number): Promise<void> {
-    this.profile = await api.profile(id);
-    localStorage.setItem(PROFILE_KEY, String(id));
+  private async signOut(): Promise<void> {
+    await api.logout().catch(() => undefined);
+    this.showSignIn();
+  }
+
+  private async useProfile(profile: Profile): Promise<void> {
+    this.profile = profile;
     this.settings = { ...DEFAULT_SETTINGS, ...this.profile.settings };
     this.applySettings();
     await this.showMainMenu();
@@ -290,10 +277,12 @@ export class App implements GameHost {
     let cp: CheckpointSummary | null = null;
     let results: ResultInfo[] = [];
     try {
-      const [all, res] = await Promise.all([api.profiles(), api.results(p.id).catch(() => [] as ResultInfo[])]);
-      cp = all.find((x) => x.id === p.id)?.checkpoint ?? null;
+      const [me, res] = await Promise.all([api.me(), api.results().catch(() => [] as ResultInfo[])]);
+      this.profile = { ...p, checkpoint: me.checkpoint, career: me.career };
+      cp = me.checkpoint;
       results = res;
-    } catch {
+    } catch (e) {
+      if (e instanceof AuthError) return this.showSignIn();
       /* offline */
     }
     const c = this.career;
@@ -304,7 +293,7 @@ export class App implements GameHost {
     this.show(this.menuShell(
       h('div', { class: 'welcome' },
         h('span', { class: 'avatar' }, initials(p.name)),
-        h('div', { class: 'who' }, h('div', null, 'Welcome back'), h('b', null, p.name)),
+        h('div', { class: 'who' }, h('div', null, 'Welcome back'), h('b', null, p.name), p.email ? h('small', { class: 'dim' }, p.email) : null),
       ),
       h('div', { class: 'menu-grid' },
         h('div', { class: 'menu-buttons' },
@@ -345,9 +334,9 @@ export class App implements GameHost {
         h('button', { class: 'btn', onclick: () => void this.showLoad() }, icon('folder'), 'Load game'),
         h('button', { class: 'btn', onclick: () => this.showSettings() }, icon('gear'), 'Settings'),
         h('button', { class: 'btn', id: 'btn-help', onclick: () => this.openHelp() }, icon('help'), 'Help'),
-        h('button', { class: 'btn', onclick: () => { localStorage.removeItem(PROFILE_KEY); this.profile = null; void this.showProfiles(); } }, icon('users'), 'Switch profile'),
+        h('button', { class: 'btn', id: 'btn-signout', onclick: () => void this.signOut() }, icon('user'), 'Sign out'),
       ),
-      h('div', { class: 'footer dim' }, icon('save'), 'Your progress is saved automatically on the server.'),
+      h('div', { class: 'footer dim' }, icon('save'), 'Your progress is saved automatically to your account.'),
     ));
   }
 
@@ -444,9 +433,8 @@ export class App implements GameHost {
   private async startSession(cfg: SessionConfig): Promise<void> {
     if (!this.profile) return;
     try {
-      // The profile list carries the checkpoint summary, so no 404-producing GET when there is none.
-      const pid = this.profile.id;
-      const cp = (await api.profiles()).find((x) => x.id === pid)?.checkpoint ?? null;
+      // /api/me carries the checkpoint summary, so no 404-producing GET when there is none.
+      const cp = (await api.me()).checkpoint;
       if (cp) {
         const ok = await this.confirm('Replace checkpoint?', `Starting a new session replaces your checkpoint (${cp.title}, score ${cp.score}). Use "Save game" in the pause menu first if you want to keep it.`, 'Start new session');
         if (!ok) return;
@@ -482,7 +470,7 @@ export class App implements GameHost {
   private async continueCheckpoint(): Promise<void> {
     if (!this.profile) return;
     try {
-      const cp = await api.checkpoint(this.profile.id);
+      const cp = await api.checkpoint();
       this.launch(new World(cp.state.cfg, cp.state));
       this.game!.togglePause(true);
       const m = this.modal('Welcome back', [
@@ -497,15 +485,14 @@ export class App implements GameHost {
 
   private async showLoad(): Promise<void> {
     if (!this.profile) return;
-    const pid = this.profile.id;
-    const list = await api.saves(pid).catch(() => []);
+    const list = await api.saves().catch(() => []);
     const body = h('div', { class: 'save-list' },
       ...(list.length ? list.map((s) =>
         h('div', { class: 'save' },
           h('button', {
             class: 'save-main', onclick: async () => {
               try {
-                const full = await api.loadSave(pid, s.id);
+                const full = await api.loadSave(s.id);
                 this.closeModal(m);
                 if (this.game && !(await this.confirm('Load game', 'Leave the current session? Its checkpoint will be replaced by the loaded game.', 'Load'))) return;
                 this.launch(new World(full.state.cfg, full.state));
@@ -520,7 +507,7 @@ export class App implements GameHost {
           h('button', {
             class: 'icon danger', title: 'Delete save', 'aria-label': `Delete ${s.label}`, onclick: async () => {
               if (await this.confirm('Delete save', `Delete "${s.label}"?`, 'Delete', true)) {
-                await api.deleteSave(pid, s.id);
+                await api.deleteSave(s.id);
                 this.closeModal(m);
                 void this.showLoad();
               }
@@ -552,7 +539,7 @@ export class App implements GameHost {
             const label = await this.prompt('Save game', 'Name', `${g.summary().title} · ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
             if (label == null || !this.profile) return;
             try {
-              await api.createSave(this.profile.id, label, g.world.snapshot(), g.summary());
+              await api.createSave(label, g.world.snapshot(), g.summary());
               this.toast(`Saved "${label}"`);
             } catch (e) {
               this.toast((e as Error).message, true);
@@ -586,7 +573,7 @@ export class App implements GameHost {
     const passed = s ? world.ended !== 'failed' && world.score >= s.passScore : true;
     let unlockedNext = false;
     if (p) {
-      void api.deleteCheckpoint(p.id).catch(() => undefined);
+      void api.deleteCheckpoint().catch(() => undefined);
       if (s) {
         const c = this.career;
         const best = c.best[s.id];
@@ -598,8 +585,8 @@ export class App implements GameHost {
         const totalStars = Object.values(c.best).reduce((n, b) => n + b.stars, 0);
         const summary = `Shift ${Math.min(c.unlocked, SHIFTS.length)} of ${SHIFTS.length} · ${totalStars}★`;
         p.career = { ...c, summary };
-        void api.saveCareer(p.id, { ...c, summary });
-        void api.postResult(p.id, { shiftId: s.id, airport: world.cfg.airport, score: world.score, stars, stats: st });
+        void api.saveCareer({ ...c, summary });
+        void api.postResult({ shiftId: s.id, airport: world.cfg.airport, score: world.score, stars, stats: st });
       }
     }
     const tile = (ic: string, label: string, v: number, bad = false): HTMLElement => h('div', { class: bad && v > 0 ? 'bad' : '' }, icon(ic), h('b', null, String(v)), h('span', null, label));
@@ -710,6 +697,30 @@ export class App implements GameHost {
         h('h4', null, 'Session'),
         range('autosaveSec', 'Autosave interval', 'How often the checkpoint is saved while playing', 10, 120, 5, (v) => `${v} s`),
         check('pauseOnBlur', 'Pause when the tab is hidden'),
+        h('h4', null, 'Account'),
+        opt('Signed in', this.profile?.email || this.profile?.name || '', h('button', {
+          class: 'btn sm', disabled: this.game ? '' : null, title: this.game ? 'Finish or exit the session first' : 'Sign out of this device',
+          onclick: (e: Event) => {
+            e.preventDefault();
+            this.closeTopModal();
+            void this.signOut();
+          },
+        }, 'Sign out')),
+        opt('Delete my account', 'Removes your profile, career, checkpoint, saved games and results for good', h('button', {
+          class: 'btn sm danger', id: 'btn-delete-account', disabled: this.game ? '' : null, title: this.game ? 'Finish or exit the session first' : 'Delete account',
+          onclick: async (e: Event) => {
+            e.preventDefault();
+            if (!(await this.confirm('Delete account', 'Delete your profile with all careers, checkpoints, saved games and results? This cannot be undone.', 'Delete everything', true))) return;
+            try {
+              await api.deleteAccount();
+            } catch (err) {
+              if (!(err instanceof AuthError)) return this.toast((err as Error).message, true);
+            }
+            this.profile = null; // nothing left to persist when the settings dialog closes
+            for (const m of [...this.modals].reverse()) this.closeModal(m);
+            this.showSignIn();
+          },
+        }, 'Delete')),
       ]],
       ['controls', 'Controls', 'keyboard', () => [
         h('h4', null, 'General'),

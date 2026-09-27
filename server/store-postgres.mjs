@@ -12,7 +12,11 @@ const SCHEMA = [
     settings TEXT NOT NULL DEFAULT '{}',
     career TEXT NOT NULL DEFAULT '{}'
   )`,
-  'CREATE UNIQUE INDEX IF NOT EXISTS profiles_name_ci ON profiles (lower(name))',
+  // Profiles belong to a Google account; pre-auth profiles had no owner and are dropped with their data.
+  'ALTER TABLE profiles ADD COLUMN IF NOT EXISTS google_sub TEXT',
+  "ALTER TABLE profiles ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT ''",
+  'DROP INDEX IF EXISTS profiles_name_ci',
+  'CREATE UNIQUE INDEX IF NOT EXISTS profiles_google_sub ON profiles (google_sub)',
   `CREATE TABLE IF NOT EXISTS saves (
     id SERIAL PRIMARY KEY,
     profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
@@ -36,6 +40,7 @@ const SCHEMA = [
     completed_at BIGINT NOT NULL
   )`,
   'CREATE INDEX IF NOT EXISTS results_by_profile ON results (profile_id, completed_at DESC)',
+  'DELETE FROM profiles WHERE google_sub IS NULL',
 ];
 
 // BIGINT and COUNT come back as strings.
@@ -66,17 +71,16 @@ export function createPostgresStore(url = process.env.DATABASE_URL || process.en
   };
 
   return {
-    countProfiles: db(async () => one(await sql`SELECT COUNT(*) AS n FROM profiles`).n),
-    listProfiles: db(async () =>
-      all(await sql`
-        SELECT p.id, p.name, p.created_at, p.last_played_at, p.career,
-          (SELECT s.summary FROM saves s WHERE s.profile_id = p.id AND s.kind = 'auto') AS checkpoint
-        FROM profiles p ORDER BY p.last_played_at DESC`),
-    ),
     getProfile: db(async (id) => one(await sql`SELECT * FROM profiles WHERE id = ${id}`)),
-    findProfileByName: db(async (name) => one(await sql`SELECT id FROM profiles WHERE lower(name) = lower(${name})`)),
-    insertProfile: db(async (name, now) =>
-      one(await sql`INSERT INTO profiles (name, created_at, last_played_at) VALUES (${name}, ${now}, ${now}) RETURNING id`).id,
+    upsertUserProfile: db(async ({ sub, email, name, now }) =>
+      one(await sql`
+        INSERT INTO profiles (google_sub, email, name, created_at, last_played_at)
+        VALUES (${sub}, ${email}, ${name}, ${now}, ${now})
+        ON CONFLICT (google_sub) DO UPDATE SET email = CASE WHEN EXCLUDED.email <> '' THEN EXCLUDED.email ELSE profiles.email END
+        RETURNING *`),
+    ),
+    getCheckpointSummary: db(async (id) =>
+      one(await sql`SELECT summary FROM saves WHERE profile_id = ${id} AND kind = 'auto'`)?.summary ?? null,
     ),
     deleteProfile: db(async (id) => void (await sql`DELETE FROM profiles WHERE id = ${id}`)),
     setSettings: db(async (id, text) => void (await sql`UPDATE profiles SET settings = ${text} WHERE id = ${id}`)),

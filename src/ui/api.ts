@@ -1,4 +1,4 @@
-// Thin client for the persistence API served by the container (server/server.mjs).
+// Thin client for the persistence API (server/api-core.mjs). Every call acts on the signed-in user's own profile.
 
 import type { CareerState } from '../sim/career';
 import type { WorldSnapshot } from '../sim/world';
@@ -12,15 +12,6 @@ export interface CheckpointSummary {
   simTime: number;
   remaining: number | null;
   savedAt: number;
-}
-
-export interface ProfileSummary {
-  id: number;
-  name: string;
-  createdAt: number;
-  lastPlayedAt: number;
-  careerSummary: string | null;
-  checkpoint: CheckpointSummary | null;
 }
 
 export interface Settings {
@@ -106,13 +97,16 @@ export const DEFAULT_SETTINGS: Settings = {
   stripsCollapsed: false,
 };
 
+/** The signed-in Google account's player profile. */
 export interface Profile {
   id: number;
   name: string;
+  email: string;
   createdAt: number;
   lastPlayedAt: number;
   settings: Partial<Settings>;
   career: Partial<CareerState> & { summary?: string };
+  checkpoint: CheckpointSummary | null;
 }
 
 export interface SaveInfo {
@@ -132,6 +126,9 @@ export interface ResultInfo {
   completedAt: number;
 }
 
+/** Thrown when the session is missing or expired (HTTP 401). */
+export class AuthError extends Error {}
+
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const r = await fetch(url, {
     method,
@@ -140,31 +137,35 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   });
   if (r.status === 204) return undefined as T;
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((data as { error?: string }).error ?? `HTTP ${r.status}`);
+  const msg = (data as { error?: string }).error ?? `HTTP ${r.status}`;
+  if (r.status === 401) throw new AuthError(msg);
+  if (!r.ok) throw new Error(msg);
   return data as T;
 }
 
+/** Full-page navigation to Google's consent screen; the server redirects back to `/`. */
+export const LOGIN_URL = '/api/auth/login';
+
 export const api = {
-  health: () => req<{ ok: boolean; version: string }>('GET', '/api/health'),
-  profiles: () => req<ProfileSummary[]>('GET', '/api/profiles'),
-  createProfile: (name: string) => req<Profile>('POST', '/api/profiles', { name }),
-  profile: (id: number) => req<Profile>('GET', `/api/profiles/${id}`),
-  deleteProfile: (id: number) => req<void>('DELETE', `/api/profiles/${id}`),
-  saveSettings: (id: number, s: Settings) => req<{ ok: boolean }>('PUT', `/api/profiles/${id}/settings`, s),
-  saveCareer: (id: number, c: CareerState & { summary: string }) => req<{ ok: boolean }>('PUT', `/api/profiles/${id}/career`, c),
-  checkpoint: (id: number) => req<{ summary: CheckpointSummary; state: WorldSnapshot; updatedAt: number }>('GET', `/api/profiles/${id}/checkpoint`),
-  putCheckpoint: (id: number, state: WorldSnapshot, summary: CheckpointSummary) =>
-    req<{ ok: boolean; updatedAt: number }>('PUT', `/api/profiles/${id}/checkpoint`, { state, summary }),
+  health: () => req<{ ok: boolean; version: string; auth: boolean }>('GET', '/api/health'),
+  me: () => req<Profile>('GET', '/api/me'),
+  logout: () => req<void>('POST', '/api/auth/logout'),
+  deleteAccount: () => req<void>('DELETE', '/api/me'),
+  saveSettings: (s: Settings) => req<{ ok: boolean }>('PUT', '/api/me/settings', s),
+  saveCareer: (c: CareerState & { summary: string }) => req<{ ok: boolean }>('PUT', '/api/me/career', c),
+  checkpoint: () => req<{ summary: CheckpointSummary; state: WorldSnapshot; updatedAt: number }>('GET', '/api/me/checkpoint'),
+  putCheckpoint: (state: WorldSnapshot, summary: CheckpointSummary) =>
+    req<{ ok: boolean; updatedAt: number }>('PUT', '/api/me/checkpoint', { state, summary }),
   /** Best-effort save while the page is closing. */
-  beaconCheckpoint: (id: number, state: WorldSnapshot, summary: CheckpointSummary): boolean =>
-    navigator.sendBeacon(`/api/profiles/${id}/checkpoint`, new Blob([JSON.stringify({ state, summary })], { type: 'application/json' })),
-  deleteCheckpoint: (id: number) => req<void>('DELETE', `/api/profiles/${id}/checkpoint`),
-  saves: (id: number) => req<SaveInfo[]>('GET', `/api/profiles/${id}/saves`),
-  createSave: (id: number, label: string, state: WorldSnapshot, summary: CheckpointSummary) =>
-    req<SaveInfo>('POST', `/api/profiles/${id}/saves`, { label, state, summary }),
-  loadSave: (id: number, saveId: number) => req<SaveInfo & { state: WorldSnapshot }>('GET', `/api/profiles/${id}/saves/${saveId}`),
-  deleteSave: (id: number, saveId: number) => req<void>('DELETE', `/api/profiles/${id}/saves/${saveId}`),
-  postResult: (id: number, r: { shiftId: string; airport: string; score: number; stars: number; stats: unknown }) =>
-    req<{ id: number }>('POST', `/api/profiles/${id}/results`, r),
-  results: (id: number) => req<ResultInfo[]>('GET', `/api/profiles/${id}/results`),
+  beaconCheckpoint: (state: WorldSnapshot, summary: CheckpointSummary): boolean =>
+    navigator.sendBeacon('/api/me/checkpoint', new Blob([JSON.stringify({ state, summary })], { type: 'application/json' })),
+  deleteCheckpoint: () => req<void>('DELETE', '/api/me/checkpoint'),
+  saves: () => req<SaveInfo[]>('GET', '/api/me/saves'),
+  createSave: (label: string, state: WorldSnapshot, summary: CheckpointSummary) =>
+    req<SaveInfo>('POST', '/api/me/saves', { label, state, summary }),
+  loadSave: (saveId: number) => req<SaveInfo & { state: WorldSnapshot }>('GET', `/api/me/saves/${saveId}`),
+  deleteSave: (saveId: number) => req<void>('DELETE', `/api/me/saves/${saveId}`),
+  postResult: (r: { shiftId: string; airport: string; score: number; stars: number; stats: unknown }) =>
+    req<{ id: number }>('POST', '/api/me/results', r),
+  results: () => req<ResultInfo[]>('GET', '/api/me/results'),
 };

@@ -30,6 +30,16 @@
 .avatar.sm { width: 2.1rem; height: 2.1rem; font-size: var(--fs-md); }
 .welcome .who b { font-size: var(--fs-lg); }
 .welcome .who div { color: var(--dim); font-size: var(--fs-md); }
+.welcome .who { display: flex; flex-direction: column; }
+.welcome .who small { font-size: var(--fs-sm); }
+
+/* Sign-in card shown before a Google session exists. */
+.signin { display: flex; flex-direction: column; align-items: flex-start; gap: var(--sp-3); max-width: 30rem; padding: var(--sp-5); }
+.signin h2 { margin: 0; }
+.signin p { margin: 0; line-height: 1.5; }
+.btn.google { background: #fff; color: #1f1f1f; border-color: #dadce0; font-weight: 600; padding: 0.65rem 1.1rem; text-decoration: none; }
+.btn.google:hover { background: #f1f3f4; border-color: #c6c9cc; }
+.btn.google .ic { width: 1.15rem; height: 1.15rem; }
 .menu-grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: var(--sp-5); }
 .menu-buttons { display: flex; flex-direction: column; gap: var(--sp-3); }
 .big { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 2px var(--sp-4); text-align: left; padding: var(--sp-4) var(--sp-5); border-radius: var(--r-xl); border: 1px solid var(--line); background: rgba(17, 38, 47, 0.8); cursor: pointer; transition: transform var(--t-fast), border-color var(--t-fast), background var(--t-fast); }
